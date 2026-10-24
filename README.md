@@ -9,10 +9,11 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
 
 ## Status
 
-**Em construção.** Neste momento o repositório contém apenas a fundação do projeto (ferramentas e
-configuração). Ainda **não há** código de domínio, API, banco de dados, migrations, mensageria nem
-testes. Esta seção será atualizada a cada etapa concluída; nada será descrito como pronto antes de
-estar implementado e verificado.
+**Em construção.** Neste momento o repositório contém a fundação do projeto (ferramentas e
+configuração) e o bootstrap mínimo do NestJS com `GET /health/live`, coberto por testes HTTP.
+Ainda **não há** código de domínio, banco de dados, migrations, mensageria nem `GET /health/ready`.
+Esta seção será atualizada a cada etapa concluída; nada será descrito como pronto antes de estar
+implementado e verificado.
 
 ## Stack alvo
 
@@ -38,16 +39,26 @@ Definida pelo desafio e ainda não implementada:
 
 ```bash
 bun install
-bun run lint
+bun run check
+bun run dev        # http://localhost:3000/health/live
 ```
+
+A porta HTTP é lida de `PORT` (padrão `3000`; inteiro entre 1 e 65535).
 
 ## Scripts disponíveis
 
-| Script             | Descrição                                        |
-| ------------------ | ------------------------------------------------ |
-| `bun run lint`     | Verifica formatação e regras de lint com o Biome |
-| `bun run lint:fix` | Aplica as correções automáticas do Biome         |
-| `bun run format`   | Formata os arquivos com o Biome                  |
+| Script                     | Descrição                                                      |
+| -------------------------- | -------------------------------------------------------------- |
+| `bun run dev`              | Sobe a API com recarga automática                              |
+| `bun run start`            | Sobe a API                                                     |
+| `bun run lint`             | Verifica formatação e regras de lint com o Biome               |
+| `bun run lint:fix`         | Aplica as correções automáticas do Biome                       |
+| `bun run format`           | Formata os arquivos com o Biome                                |
+| `bun run typecheck`        | Verifica os tipos com `tsc --noEmit`                           |
+| `bun run test`             | Executa todos os testes (`bun test`)                           |
+| `bun run test:smoke`       | Sobe `src/main.ts` em processo separado e chama a API por HTTP |
+| `bun run test:integration` | Testes HTTP em processo com `@nestjs/testing`                  |
+| `bun run check`            | Lint, typecheck e testes                                       |
 
 ## Segurança
 
