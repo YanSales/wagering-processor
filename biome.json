@@ -2,7 +2,15 @@
   "$schema": "https://biomejs.dev/schemas/2.6.3/schema.json",
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!**/node_modules", "!**/dist", "!**/coverage", "!bun.lock"]
+    "includes": [
+      "**",
+      "!**/node_modules",
+      "!**/dist",
+      "!**/coverage",
+      "!bun.lock",
+      "!**/.claude",
+      "!**/CLAUDE.md"
+    ]
   },
   "formatter": {
     "enabled": true,
