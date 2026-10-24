@@ -4,8 +4,11 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../src/app.module';
+import { assertTestDatabaseEnv, TEST_DATABASE_SUFFIX } from '../support/test-database';
 
-// Requer o PostgreSQL do compose.yaml em execução (`bun run db:up`) e o `.env` configurado.
+// Requer o banco de teste (`bun run db:test:up`) e o `.env.test`; recusa outro banco.
+assertTestDatabaseEnv();
+
 describe('PostgreSQL via MikroORM (integração com banco real)', () => {
   let app: INestApplication;
   let orm: MikroORM;
@@ -24,8 +27,14 @@ describe('PostgreSQL via MikroORM (integração com banco real)', () => {
     }
   });
 
-  test('a aplicação conecta ao banco configurado', async () => {
+  test('a aplicação conecta ao banco de teste configurado', async () => {
     expect(await orm.checkConnection()).toEqual({ ok: true });
+
+    const [current] = await orm.em
+      .getConnection()
+      .execute<{ name: string }[]>('select current_database() as name');
+    expect(current?.name).toBe(process.env.DB_NAME as string);
+    expect(current?.name.endsWith(TEST_DATABASE_SUFFIX)).toBe(true);
 
     const rows = await orm.em.getConnection().execute<{ ok: number }[]>('select 1 as ok');
     expect(rows).toEqual([{ ok: 1 }]);

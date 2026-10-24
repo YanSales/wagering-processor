@@ -41,16 +41,18 @@ Definida pelo desafio; PostgreSQL, Docker Compose e MikroORM já estão configur
 
 ```bash
 bun install
-cp .env.example .env   # ajuste a senha local; o .env não é versionado
-bun run db:up          # sobe o PostgreSQL e aguarda o healthcheck
+cp .env.example .env            # ajuste a senha local; o .env não é versionado
+cp .env.test.example .env.test  # ambiente dos testes com banco (valores fictícios)
+bun run db:up                   # PostgreSQL de desenvolvimento
+bun run db:test:up              # PostgreSQL de testes (descartável)
 bun run check
 bun run dev            # http://localhost:3000/health/live
 ```
 
-O Bun carrega o `.env` automaticamente (aplicação, testes e CLI do MikroORM) e o Docker Compose
-lê o mesmo arquivo. A porta HTTP é lida de `PORT` (padrão `3000`; inteiro entre 1 e 65535).
+O Bun carrega o `.env` automaticamente na aplicação e no CLI do MikroORM, e o Docker Compose lê
+o mesmo arquivo. Os testes **não** usam o `.env`: veja [Testes](#testes). A porta HTTP é lida de `PORT` (padrão `3000`; inteiro entre 1 e 65535).
 
-A aplicação e os testes de integração exigem o PostgreSQL em execução: na inicialização a API
+A aplicação exige o PostgreSQL em execução: na inicialização a API
 valida a conexão com `select 1` e encerra com erro se o banco estiver inacessível ou as
 credenciais estiverem erradas.
 
@@ -81,31 +83,56 @@ bun run migration:pending    # migrations pendentes
 bun run migration:check      # verifica se o schema mapeado exige nova migration
 ```
 
+## Testes
+
+| Comando                    | Ambiente                    | Precisa de Docker?        |
+| -------------------------- | --------------------------- | ------------------------- |
+| `bun run test:unit`        | nenhum (`--no-env-file`)    | Não                       |
+| `bun run test:integration` | apenas `.env.test`          | Sim: `bun run db:test:up` |
+| `bun run test:smoke`       | apenas `.env.test`          | Sim: `bun run db:test:up` |
+| `bun run test`             | os três acima, em sequência | Sim                       |
+- O banco de testes é o serviço `postgres-test` de `compose.test.yaml`: projeto Compose próprio
+  (`wagering-processor-test`), dados em `tmpfs` (descartados ao remover o container), porta
+  `127.0.0.1:55432` e limite de 256 MB. `bun run db:test:down` não afeta o banco de
+  desenvolvimento nem seu volume.
+- Testes de integração e smoke chamam `assertTestDatabaseEnv()` (`test/support/test-database.ts`)
+  antes de conectar: exigem `NODE_ENV=test` (definido pelo `bun test`) e `DB_NAME` terminado em
+  `_test`. Caso contrário, falham com uma mensagem explicando como configurar o ambiente.
+- Por que `--env-file=.env.test`: sem ele, `bun test` carrega o `.env` de desenvolvimento e o
+  `.env.test` por cima, e variáveis que só existem no `.env` vazam para os testes. Variáveis do
+  shell continuam tendo precedência sobre os arquivos; a proteção acima cobre esse caso.
+- O teste smoke inicia `src/main.ts` com `bun --no-env-file`, porque o processo filho, mesmo
+  herdando o ambiente, recarregaria o `.env` do diretório para as variáveis ausentes.
+
 ## Scripts disponíveis
 
-| Script                      | Descrição                                                      |
-| --------------------------- | -------------------------------------------------------------- |
-| `bun run dev`               | Sobe a API com recarga automática                              |
-| `bun run start`             | Sobe a API                                                     |
-| `bun run lint`              | Verifica formatação e regras de lint com o Biome               |
-| `bun run lint:fix`          | Aplica as correções automáticas do Biome                       |
-| `bun run format`            | Formata os arquivos com o Biome                                |
-| `bun run typecheck`         | Verifica os tipos com `tsc --noEmit`                           |
-| `bun run test`              | Executa todos os testes (`bun test`)                           |
-| `bun run test:smoke`        | Sobe `src/main.ts` em processo separado e chama a API por HTTP |
-| `bun run test:integration`  | Testes HTTP em processo com `@nestjs/testing`                  |
-| `bun run db:up`             | Sobe o PostgreSQL e aguarda ficar saudável                     |
-| `bun run db:down`           | Para e remove o container (mantém o volume de dados)           |
-| `bun run db:logs`           | Acompanha os logs do PostgreSQL                                |
-| `bun run migration:create`  | Gera uma migration a partir da diferença de schema             |
-| `bun run migration:up`      | Aplica as migrations pendentes                                 |
-| `bun run migration:down`    | Reverte a última migration                                     |
-| `bun run migration:list`    | Lista as migrations executadas                                 |
-| `bun run migration:pending` | Lista as migrations pendentes                                  |
-| `bun run migration:check`   | Verifica se o schema exige uma nova migration                  |
-| `bun run check`             | Lint, typecheck e testes (requer o banco em execução)          |
+| Script                      | Descrição                                                    |
+| --------------------------- | ------------------------------------------------------------ |
+| `bun run dev`               | Sobe a API com recarga automática                            |
+| `bun run start`             | Sobe a API                                                   |
+| `bun run lint`              | Verifica formatação e regras de lint com o Biome             |
+| `bun run lint:fix`          | Aplica as correções automáticas do Biome                     |
+| `bun run format`            | Formata os arquivos com o Biome                              |
+| `bun run typecheck`         | Verifica os tipos com `tsc --noEmit`                         |
+| `bun run test`              | Unitários, integração e smoke, em sequência                  |
+| `bun run test:unit`         | Testes unitários, sem banco e sem arquivos `.env`            |
+| `bun run test:integration`  | Testes em processo com `@nestjs/testing` no banco de teste   |
+| `bun run test:smoke`        | Sobe `src/main.ts` em processo separado, no banco de teste   |
+| `bun run db:up`             | Sobe o PostgreSQL e aguarda ficar saudável                   |
+| `bun run db:down`           | Para e remove o container (mantém o volume de dados)         |
+| `bun run db:logs`           | Acompanha os logs do PostgreSQL                              |
+| `bun run db:test:up`        | Sobe o PostgreSQL de testes (tmpfs) e aguarda ficar saudável |
+| `bun run db:test:down`      | Remove o PostgreSQL de testes e seus dados descartáveis      |
+| `bun run migration:create`  | Gera uma migration a partir da diferença de schema           |
+| `bun run migration:up`      | Aplica as migrations pendentes                               |
+| `bun run migration:down`    | Reverte a última migration                                   |
+| `bun run migration:list`    | Lista as migrations executadas                               |
+| `bun run migration:pending` | Lista as migrations pendentes                                |
+| `bun run migration:check`   | Verifica se o schema exige uma nova migration                |
+| `bun run check`             | Lint, typecheck e todos os testes (requer `db:test:up`)      |
 
 ## Segurança
 
 Este é um repositório público. Não versione senhas, tokens, chaves ou credenciais reais. Arquivos
-`.env` são ignorados pelo Git; apenas o modelo `.env.example`, com valores fictícios, é versionado.
+`.env` são ignorados pelo Git; apenas os modelos `.env.example` e `.env.test.example`, com valores fictícios,
+são versionados.

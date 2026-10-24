@@ -1,6 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { fileURLToPath } from 'node:url';
 import type { Subprocess } from 'bun';
+import { assertTestDatabaseEnv } from '../support/test-database';
+
+// A aplicação conecta ao PostgreSQL no bootstrap: só roda contra o banco de teste.
+assertTestDatabaseEnv();
 
 const MAIN_PATH = fileURLToPath(new URL('../../src/main.ts', import.meta.url));
 const STARTUP_TIMEOUT_MS = 10_000;
@@ -35,7 +39,9 @@ describe('smoke: bun src/main.ts', () => {
   let child: Subprocess;
 
   beforeAll(() => {
-    child = Bun.spawn([process.execPath, MAIN_PATH], {
+    // `--no-env-file`: sem ele, o processo filho recarrega o `.env` de desenvolvimento do cwd para
+    // toda variável ausente. Assim o filho recebe apenas o ambiente de teste já validado.
+    child = Bun.spawn([process.execPath, '--no-env-file', MAIN_PATH], {
       env: { ...process.env, PORT: String(port) },
       stdout: 'ignore',
       stderr: 'inherit',

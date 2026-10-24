@@ -3,6 +3,10 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../src/app.module';
+import { assertTestDatabaseEnv } from '../support/test-database';
+
+// O AppModule conecta ao PostgreSQL no bootstrap: só roda contra o banco de teste.
+assertTestDatabaseEnv();
 
 describe('GET /health/live (integração HTTP em processo)', () => {
   let app: INestApplication;

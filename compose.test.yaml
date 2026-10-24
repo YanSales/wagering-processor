@@ -1,0 +1,31 @@
+# PostgreSQL descartável para os testes de integração e smoke. Projeto Compose separado do de
+# desenvolvimento: `down` aqui nunca afeta o container nem o volume `postgres-data`.
+# Uso: `bun run db:test:up` (lê `.env.test`; copie de `.env.test.example`).
+name: wagering-processor-test
+
+services:
+  postgres-test:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:?defina DB_USER no .env.test}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?defina DB_PASSWORD no .env.test}
+      POSTGRES_DB: ${DB_NAME:?defina DB_NAME no .env.test}
+    ports:
+      # Porta própria, exposta apenas no loopback do host.
+      - "127.0.0.1:${DB_PORT:?defina DB_PORT no .env.test}:5432"
+    # Dados em memória: descartados ao remover o container. Montado no mesmo caminho do VOLUME da
+    # imagem, para não criar volume anônimo.
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+    restart: "no"
