@@ -1,0 +1,25 @@
+# Dependências
+node_modules/
+
+# Build, cobertura e caches
+dist/
+coverage/
+*.tsbuildinfo
+
+# Variáveis de ambiente locais (nunca versionar segredos; o modelo é o .env.example)
+.env
+.env.*
+!.env.example
+
+# Chaves e certificados
+*.pem
+*.key
+
+# Logs
+*.log
+
+# Editores e sistema operacional
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

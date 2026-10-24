@@ -1,0 +1,3 @@
+# Normaliza finais de linha para LF em todos os sistemas.
+# Necessário para scripts executados em containers Linux (ex.: .sh) não quebrarem no Windows.
+* text=auto eol=lf
