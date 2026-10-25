@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { CurrencyMismatchError, Money } from '../../src/domain/money';
+import { CurrencyMismatchError, InvalidMoneyError, Money } from '../../src/domain/money';
 
 const brl = (cents: bigint) => Money.fromCents(cents, 'BRL');
 
@@ -145,5 +145,163 @@ describe('Money: imutabilidade e conversões implícitas', () => {
 
   test('não é serializado silenciosamente em JSON', () => {
     expect(() => JSON.stringify({ balance: brl(100n) })).toThrow(TypeError);
+  });
+});
+
+describe('Money.fromProps: representação dos contratos de entrada', () => {
+  // `currency` omitido usa BRL; `undefined` explícito é preservado (caso "ausente").
+  const props = (amount: unknown, ...currency: [unknown?]) =>
+    ({ amount, currency: currency.length === 0 ? 'BRL' : currency[0] }) as unknown as {
+      amount: string;
+      currency: string;
+    };
+
+  test.each([
+    ['25.00', 2500n],
+    ['0.00', 0n],
+    ['0.05', 5n],
+    ['0.50', 50n],
+    ['1.01', 101n],
+    ['1000.00', 100_000n],
+    // Além de Number.MAX_SAFE_INTEGER: a conversão não passa por number.
+    ['90071992547409.93', 9_007_199_254_740_993n],
+    ['1000000000000000000000000000000.00', 10n ** 32n],
+  ])('converte "%s" para %p centavos', (amount, cents) => {
+    const money = Money.fromProps(props(amount));
+
+    expect(money.cents).toBe(cents);
+    expect(money.currency).toBe('BRL');
+  });
+
+  test('preserva a moeda informada', () => {
+    expect(Money.fromProps(props('1.00', 'USD')).currency).toBe('USD');
+  });
+
+  // Entradas que o contrato §6.1 manda rejeitar explicitamente.
+  test.each([
+    ['NaN', 'NaN'],
+    ['Infinity', 'Infinity'],
+    ['-Infinity', '-Infinity'],
+    ['notação científica', '1e3'],
+    ['notação científica com casas', '2.5e1'],
+    ['string vazia', ''],
+    ['mais de 2 casas', '25.000'],
+    ['mais de 2 casas (arredondaria)', '0.005'],
+    ['valor negativo', '-25.00'],
+    ['zero negativo', '-0.00'],
+  ])('rejeita %s: %p', (_case, amount) => {
+    expect(() => Money.fromProps(props(amount))).toThrow(InvalidMoneyError);
+  });
+
+  // Formas não canônicas: o contrato exige escala fixa de 2 casas; a forma estrita é a mais segura.
+  test.each([
+    ['sem casas decimais', '25'],
+    ['uma casa decimal', '25.5'],
+    ['ponto sem casas', '25.'],
+    ['sem parte inteira', '.50'],
+    ['zero à esquerda', '01.00'],
+    ['sinal positivo', '+25.00'],
+    ['vírgula decimal', '25,00'],
+    ['separador de milhar', '1,000.00'],
+    ['outro separador', '25x00'],
+    ['espaço à esquerda', ' 25.00'],
+    ['espaço à direita', '25.00 '],
+    ['dígitos não ASCII', '٢٥.٠٠'],
+    ['hexadecimal', '0x19.00'],
+    ['texto', 'abc'],
+  ])('rejeita %s: %p', (_case, amount) => {
+    expect(() => Money.fromProps(props(amount))).toThrow(InvalidMoneyError);
+  });
+
+  test.each([
+    ['number', 25],
+    ['bigint', 2500n],
+    ['null', null],
+    ['undefined', undefined],
+    ['objeto', { value: '25.00' }],
+  ])('rejeita amount que não é string: %s', (_case, amount) => {
+    expect(() => Money.fromProps(props(amount))).toThrow(InvalidMoneyError);
+  });
+
+  test.each([
+    ['minúsculas', 'brl'],
+    ['vazia', ''],
+    ['símbolo', 'R$'],
+    ['número', 986],
+    ['ausente', undefined],
+    ['instância de Money', Money.zero('BRL')],
+  ])('rejeita currency inválida (%s) com InvalidMoneyError', (_case, currency) => {
+    expect(() => Money.fromProps(props('1.00', currency))).toThrow(InvalidMoneyError);
+  });
+
+  test.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['string', '25.00'],
+  ])('rejeita props que não são objeto: %s', (_case, value) => {
+    expect(() => Money.fromProps(value as unknown as { amount: string; currency: string })).toThrow(
+      InvalidMoneyError,
+    );
+  });
+
+  test('a mensagem de erro de entradas muito longas é truncada', () => {
+    const run = () => Money.fromProps(props(`${'9'.repeat(1000)}.000`));
+
+    expect(run).toThrow(InvalidMoneyError);
+    expect(run).not.toThrow('9'.repeat(100));
+  });
+});
+
+describe('Money.toProps: representação dos contratos', () => {
+  test.each([
+    [2500n, '25.00'],
+    [0n, '0.00'],
+    [5n, '0.05'],
+    [50n, '0.50'],
+    [101n, '1.01'],
+    [100_000n, '1000.00'],
+    [9_007_199_254_740_993n, '90071992547409.93'],
+    [-150n, '-1.50'],
+    [-5n, '-0.05'],
+    [-100n, '-1.00'],
+  ])('%p centavos -> "%s", sempre com 2 casas', (cents, amount) => {
+    expect(brl(cents).toProps()).toEqual({ amount, currency: 'BRL' });
+  });
+
+  test('retorna um objeto novo e não altera a instância', () => {
+    const money = brl(2500n);
+
+    const first = money.toProps();
+    const second = money.toProps();
+
+    expect(first).toEqual(second);
+    expect(first).not.toBe(second);
+    expect(money.cents).toBe(2500n);
+  });
+
+  test('pode ser serializado em JSON explicitamente (a instância continua bloqueada)', () => {
+    const money = brl(97_500n);
+
+    expect(JSON.stringify({ balance: money.toProps() })).toBe(
+      '{"balance":{"amount":"975.00","currency":"BRL"}}',
+    );
+    expect(() => JSON.stringify({ balance: money })).toThrow('toProps()');
+  });
+
+  test.each(['0.00', '0.05', '25.00', '975.00', '90071992547409.93'])(
+    'ida e volta preserva o valor: "%s"',
+    (amount) => {
+      const props = { amount, currency: 'BRL' };
+
+      expect(Money.fromProps(props).toProps()).toEqual(props);
+    },
+  );
+
+  test('operações sobre valores lidos do contrato continuam exatas', () => {
+    const balance = Money.fromProps({ amount: '1000.00', currency: 'BRL' });
+    const bet = Money.fromProps({ amount: '25.00', currency: 'BRL' });
+
+    expect(balance.subtract(bet).toProps()).toEqual({ amount: '975.00', currency: 'BRL' });
+    expect(bet.subtract(balance).toProps()).toEqual({ amount: '-975.00', currency: 'BRL' });
   });
 });

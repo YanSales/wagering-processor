@@ -1,11 +1,20 @@
 /**
+ * Representação de `Money` nos contratos (API, mensagens, eventos):
+ * `{ amount: "25.00", currency: "BRL" }`.
+ */
+export interface MoneyProps {
+  readonly amount: string;
+  readonly currency: string;
+}
+
+/**
  * Value Object monetário: quantia inteira em centavos (`bigint`, com sinal) e moeda ISO-4217.
  *
  * - Imutável: toda operação retorna uma nova instância.
  * - Exato: só aritmética de `bigint`; nunca passa por `number`.
  * - Multi-moeda (contrato §6.1): operações entre moedas diferentes lançam `CurrencyMismatchError`.
- * - Aceita valores negativos. Rejeitar negativos em entradas e impedir saldo negativo são regras
- *   da borda (contratos de entrada) e da carteira, não deste tipo.
+ * - Aceita valores negativos internamente. Contratos de entrada (`fromProps`) os rejeitam; impedir
+ *   saldo negativo é regra da carteira, não deste tipo.
  * - "Centavos" são a unidade de escala fixa 2 exigida pelo contrato para todas as moedas.
  */
 export class Money {
@@ -27,6 +36,35 @@ export class Money {
 
   static zero(currency: string): Money {
     return Money.fromCents(0n, currency);
+  }
+
+  /**
+   * Lê a representação dos contratos de entrada (§6.1): `amount` em string decimal canônica, não
+   * negativa e com exatamente 2 casas (`"0.05"`, `"25.00"`). Qualquer outra forma — incluindo
+   * `"25"`, `"25.5"`, `"01.00"`, `"+1.00"`, `"1e3"` ou espaços — lança `InvalidMoneyError`.
+   * A conversão é feita sobre os dígitos da string, sem passar por `number`.
+   */
+  static fromProps(props: MoneyProps): Money {
+    if (typeof props !== 'object' || props === null) {
+      throw new InvalidMoneyError('Money exige um objeto { amount, currency }.');
+    }
+    const { amount, currency } = props;
+    if (typeof amount !== 'string') {
+      throw new InvalidMoneyError(`amount deve ser uma string decimal; recebido ${typeof amount}.`);
+    }
+    if (!DECIMAL_AMOUNT.test(amount)) {
+      throw new InvalidMoneyError(
+        `amount inválido: "${preview(amount)}". ` +
+          'Use uma string decimal não negativa com exatamente duas casas, ex.: "25.00".',
+      );
+    }
+    if (typeof currency !== 'string' || !CURRENCY_CODE.test(currency)) {
+      const shown = typeof currency === 'string' ? `"${preview(currency)}"` : typeof currency;
+      throw new InvalidMoneyError(
+        `currency inválida: ${shown}. Use um código ISO-4217, ex.: "BRL".`,
+      );
+    }
+    return new Money(BigInt(amount.replace('.', '')), currency);
   }
 
   get cents(): bigint {
@@ -68,16 +106,23 @@ export class Money {
     return this.#cents < 0n;
   }
 
+  /** Representação dos contratos, sempre com 2 casas; negativos saem com `-` (ex.: `"-1.50"`). */
+  toProps(): MoneyProps {
+    const negative = this.#cents < 0n;
+    const magnitude = negative ? -this.#cents : this.#cents;
+    const units = (magnitude / 100n).toString();
+    const fraction = (magnitude % 100n).toString().padStart(2, '0');
+    return { amount: `${negative ? '-' : ''}${units}.${fraction}`, currency: this.#currency };
+  }
+
   /** Bloqueia coerções implícitas (`money + 1`, `a < b`, template strings), que seriam silenciosas. */
   [Symbol.toPrimitive](): never {
     throw new TypeError('Money não pode ser convertido implicitamente; use cents/currency.');
   }
 
-  /** Eventos e respostas carregam uma representação explícita, nunca a instância (contrato §11). */
+  /** Eventos e respostas carregam `MoneyProps` explicitamente, nunca a instância (contrato §11). */
   toJSON(): never {
-    throw new TypeError(
-      'Money não é serializável diretamente; converta para a representação do contrato.',
-    );
+    throw new TypeError('Money não é serializável diretamente; use toProps().');
   }
 
   #sameCurrency(other: Money, operation: string): Money {
@@ -98,8 +143,21 @@ export class CurrencyMismatchError extends Error {
   }
 }
 
+/** Erro de domínio: representação monetária de entrada inválida (contrato §6.1). */
+export class InvalidMoneyError extends Error {
+  override readonly name = 'InvalidMoneyError';
+}
+
 // Formato do código ISO-4217 (três letras maiúsculas). Não restringe a uma lista de moedas.
 const CURRENCY_CODE = /^[A-Z]{3}$/;
+
+// Forma canônica: sem sinal, sem zeros à esquerda, só dígitos ASCII e exatamente 2 casas.
+const DECIMAL_AMOUNT = /^(?:0|[1-9][0-9]*)\.[0-9]{2}$/;
+
+// Evita mensagens de erro gigantes quando a entrada for muito longa.
+function preview(value: string): string {
+  return value.length > 32 ? `${value.slice(0, 32)}…` : value;
+}
 
 function assertCurrency(currency: string): string {
   if (typeof currency !== 'string') {
