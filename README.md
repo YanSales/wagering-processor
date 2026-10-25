@@ -12,14 +12,15 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
 **Em construção.** Neste momento o repositório contém a fundação do projeto (ferramentas e
 configuração), o bootstrap mínimo do NestJS com `GET /health/live` e a infraestrutura de
 persistência: PostgreSQL via Docker Compose, MikroORM integrado ao NestJS e o mecanismo de
-migrations. Ainda **não há** entidades, schema de negócio, migrations, código de domínio,
-mensageria nem `GET /health/ready`.
+migrations. Também há a infraestrutura inicial de mensageria: SQS FIFO local (ElasticMQ), com
+provisionamento da fila `wager-events.fifo` e de sua DLQ. Ainda **não há** entidades, schema de
+negócio, migrations, código de domínio, publicação ou consumo de mensagens nem `GET /health/ready`.
 Esta seção será atualizada a cada etapa concluída; nada será descrito como pronto antes de estar
 implementado e verificado.
 
 ## Stack alvo
 
-Definida pelo desafio; PostgreSQL, Docker Compose e MikroORM já estão configurados:
+Definida pelo desafio; PostgreSQL, Docker Compose, MikroORM e o SQS local já estão configurados:
 
 | Item                                          | Escolha                                              |
 | --------------------------------------------- | ---------------------------------------------------- |
@@ -27,7 +28,7 @@ Definida pelo desafio; PostgreSQL, Docker Compose e MikroORM já estão configur
 | Linguagem                                     | TypeScript em modo estrito                           |
 | Framework                                     | NestJS                                               |
 | Banco de dados                                | PostgreSQL 18                                        |
-| Mensageria                                    | AWS SQS (FIFO) em ambiente local                     |
+| Mensageria                                    | AWS SQS FIFO; localmente, ElasticMQ 1.7.1            |
 | Orquestração local                            | Docker Compose                                       |
 | ORM e migrations                              | MikroORM 7, com migrations versionadas e reversíveis |
 
@@ -45,6 +46,7 @@ cp .env.example .env            # ajuste a senha local; o .env não é versionad
 cp .env.test.example .env.test  # ambiente dos testes com banco (valores fictícios)
 bun run db:up                   # PostgreSQL de desenvolvimento
 bun run db:test:up              # PostgreSQL de testes (descartável)
+bun run sqs:up                  # SQS local (ElasticMQ) e provisionamento das filas
 bun run check
 bun run dev            # http://localhost:3000/health/live
 ```
@@ -83,6 +85,50 @@ bun run migration:pending    # migrations pendentes
 bun run migration:check      # verifica se o schema mapeado exige nova migration
 ```
 
+## Mensageria (SQS)
+
+O SQS local é o [ElasticMQ](https://github.com/softwaremill/elasticmq) (`softwaremill/elasticmq-native:1.7.1`),
+serviço `sqs` do `compose.yaml`: API compatível com o SQS, sem credenciais reais, porta
+`127.0.0.1:9324`, limite de 0,5 CPU e 128 MB, healthcheck em `GET /health`. O LocalStack não foi
+usado porque, desde a versão 2026.03.0, exige token de autenticação para iniciar.
+
+| Recurso                 | Configuração (definida em `src/messaging/wager-events.queues.ts`)                     |
+| ----------------------- | ------------------------------------------------------------------------------------- |
+| `wager-events.fifo`     | FIFO, `ContentBasedDeduplication=false`, visibilidade 30 s, retenção 4 dias           |
+| Redrive policy          | Para `wager-events-dlq.fifo` após **5** recebimentos sem exclusão (`maxReceiveCount`) |
+| `wager-events-dlq.fifo` | FIFO, `ContentBasedDeduplication=false`, retenção 14 dias                             |
+
+| Variável                 | Uso                                                               |
+| ------------------------ | ----------------------------------------------------------------- |
+| `AWS_REGION`             | Região do SDK (local: qualquer valor, ex.: `us-east-1`)           |
+| `AWS_ACCESS_KEY_ID`      | Lida pelo SDK; localmente, valor fictício (o emulador não valida) |
+| `AWS_SECRET_ACCESS_KEY`  | Lida pelo SDK; localmente, valor fictício. Nunca versionar real   |
+| `SQS_ENDPOINT`           | URL do emulador; ausente, o SDK usa o SQS da AWS                  |
+| `SQS_WAGER_EVENTS_QUEUE` | Nome da fila principal (`.fifo`)                                  |
+| `SQS_WAGER_EVENTS_DLQ`   | Nome da DLQ (`.fifo`)                                             |
+
+```bash
+bun run sqs:up          # sobe o ElasticMQ, aguarda o healthcheck e provisiona as filas
+bun run sqs:provision   # (re)provisiona; idempotente, confere os atributos e falha se divergirem
+bun run sqs:inspect     # mostra URL, atributos e contagem de mensagens, sem criar filas
+curl http://127.0.0.1:9324/health
+```
+
+- **Sem acesso acidental à AWS:** sem `SQS_ENDPOINT`, `sqs:provision`/`sqs:inspect` recusam executar,
+  pois o SDK usaria o SQS da AWS e qualquer credencial real da máquina. Para operar na AWS de
+  propósito: `bun scripts/sqs.ts provision --aws`. Os testes de mensageria nunca aceitam isso.
+- **Estado em memória:** recriar o container (`sqs:down`/`sqs:up`, `db:down`) apaga filas e
+  mensagens; `sqs:up` reprovisiona. Não há volume.
+- **Garantias:** FIFO ordena por `MessageGroupId` e deduplica por `MessageDeduplicationId` numa
+  janela de 5 minutos. Isso **não** é entrega exactly-once: reentregas acontecem e o consumidor
+  precisará de idempotência de negócio (Inbox), a ser implementada.
+- **DLQ:** apenas isola mensagens que falharam 5 vezes; reprocessamento e reconciliação ainda não
+  existem.
+- **Limitação do emulador:** o ElasticMQ aceita `MessageRetentionPeriod`, mas não o reporta; o
+  provisionamento avisa que esse atributo não pôde ser conferido. No SQS da AWS ele é conferido.
+- O `MessagingModule` (`src/messaging/messaging.module.ts`) expõe a verificação de acesso às filas,
+  mas ainda não é importado pelo `AppModule`: entra com a publicação de eventos.
+
 ## Testes
 
 | Comando                    | Ambiente                    | Precisa de Docker?        |
@@ -91,6 +137,7 @@ bun run migration:check      # verifica se o schema mapeado exige nova migration
 | `bun run test:integration` | apenas `.env.test`          | Sim: `bun run db:test:up` |
 | `bun run test:smoke`       | apenas `.env.test`          | Sim: `bun run db:test:up` |
 | `bun run test`             | os três acima, em sequência | Sim                       |
+| `bun run test:sqs`         | apenas `.env.test`          | Sim: `bun run sqs:up`     |
 - O banco de testes é o serviço `postgres-test` de `compose.test.yaml`: projeto Compose próprio
   (`wagering-processor-test`), dados em `tmpfs` (descartados ao remover o container), porta
   `127.0.0.1:55432` e limite de 256 MB. `bun run db:test:down` não afeta o banco de
@@ -101,35 +148,45 @@ bun run migration:check      # verifica se o schema mapeado exige nova migration
 - Por que `--env-file=.env.test`: sem ele, `bun test` carrega o `.env` de desenvolvimento e o
   `.env.test` por cima, e variáveis que só existem no `.env` vazam para os testes. Variáveis do
   shell continuam tendo precedência sobre os arquivos; a proteção acima cobre esse caso.
+- `test:sqs` usa o ElasticMQ de desenvolvimento, mas cria e remove filas efêmeras com nome único
+  (`it-<id>-…fifo`); nunca toca `wager-events.fifo`. Recusa rodar se `SQS_ENDPOINT` estiver
+  ausente ou fora do loopback (`test/support/test-sqs.ts`), para nunca atingir o SQS da AWS.
+  Não faz parte de `bun run test`/`check`.
 - O teste smoke inicia `src/main.ts` com `bun --no-env-file`, porque o processo filho, mesmo
   herdando o ambiente, recarregaria o `.env` do diretório para as variáveis ausentes.
 
 ## Scripts disponíveis
 
-| Script                      | Descrição                                                    |
-| --------------------------- | ------------------------------------------------------------ |
-| `bun run dev`               | Sobe a API com recarga automática                            |
-| `bun run start`             | Sobe a API                                                   |
-| `bun run lint`              | Verifica formatação e regras de lint com o Biome             |
-| `bun run lint:fix`          | Aplica as correções automáticas do Biome                     |
-| `bun run format`            | Formata os arquivos com o Biome                              |
-| `bun run typecheck`         | Verifica os tipos com `tsc --noEmit`                         |
-| `bun run test`              | Unitários, integração e smoke, em sequência                  |
-| `bun run test:unit`         | Testes unitários, sem banco e sem arquivos `.env`            |
-| `bun run test:integration`  | Testes em processo com `@nestjs/testing` no banco de teste   |
-| `bun run test:smoke`        | Sobe `src/main.ts` em processo separado, no banco de teste   |
-| `bun run db:up`             | Sobe o PostgreSQL e aguarda ficar saudável                   |
-| `bun run db:down`           | Para e remove o container (mantém o volume de dados)         |
-| `bun run db:logs`           | Acompanha os logs do PostgreSQL                              |
-| `bun run db:test:up`        | Sobe o PostgreSQL de testes (tmpfs) e aguarda ficar saudável |
-| `bun run db:test:down`      | Remove o PostgreSQL de testes e seus dados descartáveis      |
-| `bun run migration:create`  | Gera uma migration a partir da diferença de schema           |
-| `bun run migration:up`      | Aplica as migrations pendentes                               |
-| `bun run migration:down`    | Reverte a última migration                                   |
-| `bun run migration:list`    | Lista as migrations executadas                               |
-| `bun run migration:pending` | Lista as migrations pendentes                                |
-| `bun run migration:check`   | Verifica se o schema exige uma nova migration                |
-| `bun run check`             | Lint, typecheck e todos os testes (requer `db:test:up`)      |
+| Script                      | Descrição                                                       |
+| --------------------------- | --------------------------------------------------------------- |
+| `bun run dev`               | Sobe a API com recarga automática                               |
+| `bun run start`             | Sobe a API                                                      |
+| `bun run lint`              | Verifica formatação e regras de lint com o Biome                |
+| `bun run lint:fix`          | Aplica as correções automáticas do Biome                        |
+| `bun run format`            | Formata os arquivos com o Biome                                 |
+| `bun run typecheck`         | Verifica os tipos com `tsc --noEmit`                            |
+| `bun run test`              | Unitários, integração e smoke, em sequência                     |
+| `bun run test:unit`         | Testes unitários, sem banco e sem arquivos `.env`               |
+| `bun run test:integration`  | Testes em processo com `@nestjs/testing` no banco de teste      |
+| `bun run test:smoke`        | Sobe `src/main.ts` em processo separado, no banco de teste      |
+| `bun run test:sqs`          | Testes de mensageria no ElasticMQ, com filas efêmeras           |
+| `bun run db:up`             | Sobe o PostgreSQL e aguarda ficar saudável                      |
+| `bun run db:down`           | Remove os containers de dev, PostgreSQL e SQS (mantém o volume) |
+| `bun run db:logs`           | Acompanha os logs do PostgreSQL                                 |
+| `bun run db:test:up`        | Sobe o PostgreSQL de testes (tmpfs) e aguarda ficar saudável    |
+| `bun run db:test:down`      | Remove o PostgreSQL de testes e seus dados descartáveis         |
+| `bun run sqs:up`            | Sobe o ElasticMQ e provisiona as filas                          |
+| `bun run sqs:down`          | Remove só o container do ElasticMQ (estado em memória)          |
+| `bun run sqs:logs`          | Acompanha os logs do ElasticMQ                                  |
+| `bun run sqs:provision`     | Provisiona as filas de forma idempotente e confere atributos    |
+| `bun run sqs:inspect`       | Mostra URL e atributos das filas, sem criá-las                  |
+| `bun run migration:create`  | Gera uma migration a partir da diferença de schema              |
+| `bun run migration:up`      | Aplica as migrations pendentes                                  |
+| `bun run migration:down`    | Reverte a última migration                                      |
+| `bun run migration:list`    | Lista as migrations executadas                                  |
+| `bun run migration:pending` | Lista as migrations pendentes                                   |
+| `bun run migration:check`   | Verifica se o schema exige uma nova migration                   |
+| `bun run check`             | Lint, typecheck e todos os testes (requer `db:test:up`)         |
 
 ## Segurança
 

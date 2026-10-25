@@ -28,5 +28,30 @@ services:
           memory: 512M
     restart: unless-stopped
 
+  # Emulador local compatível com a API do SQS (filas FIFO, deduplicação, DLQ via RedrivePolicy).
+  # Sem credenciais reais. Estado apenas em memória: filas e mensagens somem ao recriar o container;
+  # recrie as filas com `bun run sqs:provision` (ou `bun run sqs:up`).
+  sqs:
+    image: softwaremill/elasticmq-native:1.7.1
+    ports:
+      # Exposto apenas no loopback do host.
+      - "127.0.0.1:${SQS_PORT:-9324}:9324"
+    # A imagem declara VOLUME /data (usado só com persistência habilitada). O tmpfs no mesmo caminho
+    # evita a criação de um volume anônimo.
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9324/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    restart: unless-stopped
+
 volumes:
   postgres-data:
