@@ -18,7 +18,9 @@ services:
     tmpfs:
       - /var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      # Via TCP (-h 127.0.0.1): durante o initdb a imagem sobe um servidor temporário só no socket
+      # Unix, que o pg_isready sem -h aceitaria, liberando `up --wait` antes de o TCP estar pronto.
+      test: ["CMD-SHELL", 'pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 2s
       timeout: 3s
       retries: 15

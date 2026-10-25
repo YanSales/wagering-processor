@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../src/app.module';
-import { assertTestDatabaseEnv } from '../support/test-database';
+import { assertTestDatabaseEnv, DATABASE_BOOTSTRAP_TIMEOUT_MS } from '../support/test-database';
 
 // O AppModule conecta ao PostgreSQL no bootstrap: só roda contra o banco de teste.
 assertTestDatabaseEnv();
@@ -17,11 +17,11 @@ describe('GET /health/live (integração HTTP em processo)', () => {
     app = moduleRef.createNestApplication({ logger: false });
     await app.listen(0, '127.0.0.1');
     baseUrl = await app.getUrl();
-  });
+  }, DATABASE_BOOTSTRAP_TIMEOUT_MS);
 
   afterAll(async () => {
     await app?.close();
-  });
+  }, DATABASE_BOOTSTRAP_TIMEOUT_MS);
 
   test('responde 200 com status ok', async () => {
     const response = await fetch(`${baseUrl}/health/live`);

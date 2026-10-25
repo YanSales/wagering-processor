@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { Migrator } from '@mikro-orm/migrations';
+import { MikroORM } from '@mikro-orm/postgresql';
 import { readDatabaseSettings } from '../../src/database/database.config';
-import { createOrmConfig } from '../../src/database/orm.config';
+import { createOrmConfig, DATABASE_CONNECT_TIMEOUT_MS } from '../../src/database/orm.config';
 
 const SECRET = 'fake-secret-for-tests';
 
@@ -60,5 +61,38 @@ describe('createOrmConfig', () => {
     expect(config.migrations?.transactional).toBe(true);
     expect(config.migrations?.allOrNothing).toBe(true);
     expect(config.extensions).toContain(Migrator);
+  });
+
+  test('define timeout de conexão para o pg', () => {
+    expect(createOrmConfig(VALID_ENV).driverOptions).toEqual({
+      connectionTimeoutMillis: DATABASE_CONNECT_TIMEOUT_MS,
+    });
+  });
+
+  // Regressão: sem timeout, uma conexão aceita que nunca responde deixa connect/select 1 pendentes
+  // indefinidamente. Garante que o MikroORM continua repassando o valor ao Pool do pg.
+  test('conexão aceita que nunca responde falha pelo timeout, sem travar', async () => {
+    const server = Bun.listen({
+      hostname: '127.0.0.1',
+      port: 0,
+      socket: { data() {} },
+    });
+    const orm = await MikroORM.init({
+      ...createOrmConfig({ ...VALID_ENV, DB_PORT: String(server.port) }),
+      driverOptions: { connectionTimeoutMillis: 200 },
+    });
+
+    try {
+      const startedAt = performance.now();
+      await orm.connect();
+      const check = await orm.checkConnection();
+
+      expect(check.ok).toBe(false);
+      expect(check.ok ? '' : check.reason).toContain('timeout');
+      expect(performance.now() - startedAt).toBeLessThan(2_000);
+    } finally {
+      await orm.close(true);
+      server.stop(true);
+    }
   });
 });

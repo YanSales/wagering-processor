@@ -1,4 +1,13 @@
+import { DATABASE_CONNECT_TIMEOUT_MS } from '../../src/database/orm.config';
+
 type Env = Record<string, string | undefined>;
+
+/**
+ * Timeout de hooks e testes que inicializam ou encerram a aplicação com banco. Precisa exceder o
+ * timeout de conexão (mais o bootstrap do Nest) para que uma falha de conexão apareça com sua
+ * mensagem real, e não como o timeout genérico de 5 s do Bun.
+ */
+export const DATABASE_BOOTSTRAP_TIMEOUT_MS = DATABASE_CONNECT_TIMEOUT_MS + 5_000;
 
 export const TEST_DATABASE_SUFFIX = '_test';
 

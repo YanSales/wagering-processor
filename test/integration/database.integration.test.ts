@@ -4,7 +4,11 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../src/app.module';
-import { assertTestDatabaseEnv, TEST_DATABASE_SUFFIX } from '../support/test-database';
+import {
+  assertTestDatabaseEnv,
+  DATABASE_BOOTSTRAP_TIMEOUT_MS,
+  TEST_DATABASE_SUFFIX,
+} from '../support/test-database';
 
 // Requer o banco de teste (`bun run db:test:up`) e o `.env.test`; recusa outro banco.
 assertTestDatabaseEnv();
@@ -19,13 +23,13 @@ describe('PostgreSQL via MikroORM (integração com banco real)', () => {
     app = moduleRef.createNestApplication({ logger: false });
     await app.init();
     orm = app.get(MikroORM);
-  });
+  }, DATABASE_BOOTSTRAP_TIMEOUT_MS);
 
   afterAll(async () => {
     if (!closed) {
       await app?.close();
     }
-  });
+  }, DATABASE_BOOTSTRAP_TIMEOUT_MS);
 
   test('a aplicação conecta ao banco de teste configurado', async () => {
     expect(await orm.checkConnection()).toEqual({ ok: true });
@@ -61,25 +65,29 @@ describe('PostgreSQL via MikroORM (integração com banco real)', () => {
 });
 
 describe('bootstrap com credenciais inválidas', () => {
-  test('falha na inicialização, sem expor a senha na mensagem', async () => {
-    const original = process.env.DB_PASSWORD;
-    const invalid = 'invalid-password-for-test';
-    process.env.DB_PASSWORD = invalid;
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    const app = moduleRef.createNestApplication({ logger: false });
+  test(
+    'falha na inicialização, sem expor a senha na mensagem',
+    async () => {
+      const original = process.env.DB_PASSWORD;
+      const invalid = 'invalid-password-for-test';
+      process.env.DB_PASSWORD = invalid;
+      const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+      const app = moduleRef.createNestApplication({ logger: false });
 
-    try {
-      const error = await app.init().then(
-        () => undefined,
-        (reason: unknown) => reason,
-      );
+      try {
+        const error = await app.init().then(
+          () => undefined,
+          (reason: unknown) => reason,
+        );
 
-      expect(error).toBeInstanceOf(Error);
-      expect((error as Error).message).toContain('Falha ao conectar ao PostgreSQL');
-      expect((error as Error).message).not.toContain(invalid);
-    } finally {
-      process.env.DB_PASSWORD = original;
-      await app.close().catch(() => undefined);
-    }
-  });
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain('Falha ao conectar ao PostgreSQL');
+        expect((error as Error).message).not.toContain(invalid);
+      } finally {
+        process.env.DB_PASSWORD = original;
+        await app.close().catch(() => undefined);
+      }
+    },
+    DATABASE_BOOTSTRAP_TIMEOUT_MS,
+  );
 });
