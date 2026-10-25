@@ -27,11 +27,6 @@ export function createOrmConfig(env: Record<string, string | undefined> = proces
     password,
     dbName,
     entities,
-    discovery: {
-      // Apesar do nome, `true` (padrão) faz a descoberta lançar erro quando não há entidades.
-      // Remover quando a primeira entidade for registrada em `entities.ts`.
-      warnWhenNoEntities: false,
-    },
     // O banco é criado pela infraestrutura (Compose/ambiente), nunca pela aplicação.
     ensureDatabase: false,
     // Repassado ao `Pool` do `pg`: o `pool` do MikroORM 7 só aceita min, max e idleTimeoutMillis.
@@ -39,6 +34,11 @@ export function createOrmConfig(env: Record<string, string | undefined> = proces
     extensions: [Migrator],
     migrations: {
       path: MIGRATIONS_PATH,
+      // Nome fixo: o padrão (`.snapshot-<dbName>`) separaria o snapshot de dev e de teste.
+      snapshotName: '.snapshot-wagering-processor',
+      // O snapshot só muda por `migration:create`: aplicar ou reverter migrations (inclusive nos testes)
+      // não reescreve arquivos do repositório.
+      snapshotOnMigrate: false,
       emit: 'ts',
       transactional: true,
       allOrNothing: true,

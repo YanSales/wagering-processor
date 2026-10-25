@@ -9,7 +9,8 @@
       "!**/coverage",
       "!bun.lock",
       "!**/.claude",
-      "!**/CLAUDE.md"
+      "!**/CLAUDE.md",
+      "!**/migrations/.snapshot-*.json"
     ]
   },
   "formatter": {
