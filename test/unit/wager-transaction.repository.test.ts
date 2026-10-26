@@ -56,9 +56,14 @@ describe('MikroOrmWagerTransactionRepository: classificação de falhas', () => 
 
     for (const attempt of [
       repository.findExisting(keys),
-      repository.applyToLockedWallet('w', keys, () => {
-        throw new Error('não deveria decidir');
-      }),
+      repository.applyToLockedWallet(
+        'w',
+        keys,
+        { correlationId: 'c', decidedAt: new Date() },
+        () => {
+          throw new Error('não deveria decidir');
+        },
+      ),
     ]) {
       const error = await attempt.catch((e: unknown) => e);
       expect(error).toBeInstanceOf(TransientPersistenceError);

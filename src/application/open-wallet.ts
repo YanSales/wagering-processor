@@ -19,13 +19,17 @@ export interface OpenWalletCommand {
  * - Saldo inicial negativo e demais invariantes: recusados pelo domínio, antes de qualquer gravação.
  * - Wallet duplicada para o mesmo player e moeda: `WalletAlreadyExistsError` (conflito).
  *
- * Ids e relógio são injetáveis para testes; o domínio não os gera.
+ * Cada execução gera a sua correlação (no servidor, sem header de entrada), gravada na OPENING e nos
+ * eventos da abertura.
+ *
+ * Ids, correlação e relógio são injetáveis para testes; o domínio não os gera.
  */
 export class OpenWallet {
   constructor(
     private readonly wallets: WalletRepository,
     private readonly now: () => Date = () => new Date(),
     private readonly newId: () => string = randomUUID,
+    private readonly newCorrelationId: () => string = randomUUID,
   ) {}
 
   async execute({ playerId, initialBalance }: OpenWalletCommand): Promise<Wallet> {
@@ -52,7 +56,12 @@ export class OpenWallet {
         : { opening: { transactionId: opening.id, ledgerEntryId: this.newId() } }),
     });
 
-    await this.wallets.insertOpened({ wallet, opening, openingEntry });
+    await this.wallets.insertOpened({
+      wallet,
+      opening,
+      openingEntry,
+      correlationId: this.newCorrelationId(),
+    });
     return wallet;
   }
 }

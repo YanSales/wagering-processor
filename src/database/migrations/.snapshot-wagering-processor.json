@@ -5,9 +5,420 @@
   ],
   "tables": [
     {
+      "name": "outbox_messages",
+      "schema": "public",
+      "columns": {
+        "aggregate_id": {
+          "name": "aggregate_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "int",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "0",
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
+        "claim_token": {
+          "name": "claim_token",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "claimed_until": {
+          "name": "claimed_until",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "correlation_id": {
+          "name": "correlation_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "event_type": {
+          "name": "event_type",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [
+            "WagerTransactionProcessed",
+            "WagerTransactionRejected",
+            "WagerTransactionPendingReference",
+            "WalletBalanceChanged"
+          ],
+          "mappedType": "enum"
+        },
+        "event_version": {
+          "name": "event_version",
+          "type": "int",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "last_error_code": {
+          "name": "last_error_code",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "message_group_id": {
+          "name": "message_group_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "next_attempt_at": {
+          "name": "next_attempt_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "occurred_at": {
+          "name": "occurred_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "json"
+        },
+        "published_at": {
+          "name": "published_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "seq": {
+          "name": "seq",
+          "type": "bigint",
+          "unsigned": false,
+          "autoincrement": true,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "bigint"
+        },
+        "transaction_id": {
+          "name": "transaction_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": true,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        }
+      },
+      "indexes": [
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": true,
+          "keyName": "outbox_messages_pkey",
+          "primary": true,
+          "unique": true
+        },
+        {
+          "columnNames": [
+            "transaction_id",
+            "event_type"
+          ],
+          "composite": true,
+          "constraint": true,
+          "keyName": "outbox_messages_transaction_event_type_unique",
+          "primary": false,
+          "unique": true
+        },
+        {
+          "columnNames": [
+            "next_attempt_at",
+            "seq"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "outbox_messages_unpublished_due_index",
+          "primary": false,
+          "unique": false,
+          "where": "published_at is null"
+        },
+        {
+          "columnNames": [
+            "message_group_id",
+            "seq"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "outbox_messages_unpublished_group_index",
+          "primary": false,
+          "unique": false,
+          "where": "published_at is null"
+        }
+      ],
+      "checks": [
+        {
+          "name": "outbox_messages_attempts_check",
+          "expression": "attempts >= 0",
+          "definition": "check (attempts >= 0)"
+        },
+        {
+          "name": "outbox_messages_claim_check",
+          "expression": "(claimed_until is null) = (claim_token is null)",
+          "definition": "check ((claimed_until is null) = (claim_token is null))"
+        },
+        {
+          "name": "outbox_messages_event_type_check",
+          "expression": "\"event_type\" in ('WagerTransactionProcessed', 'WagerTransactionRejected', 'WagerTransactionPendingReference', 'WalletBalanceChanged')",
+          "definition": "check (\"event_type\" in ('WagerTransactionProcessed', 'WagerTransactionRejected', 'WagerTransactionPendingReference', 'WalletBalanceChanged'))",
+          "columnName": "event_type"
+        },
+        {
+          "name": "outbox_messages_event_version_check",
+          "expression": "event_version >= 1",
+          "definition": "check (event_version >= 1)"
+        },
+        {
+          "name": "outbox_messages_payload_check",
+          "expression": "payload ->> 'eventId' = id::text and payload ->> 'eventType' = event_type and (payload ->> 'version')::int = event_version and payload ->> 'aggregateId' = aggregate_id::text and payload ->> 'correlationId' = correlation_id::text and payload -> 'data' ->> 'walletId' = message_group_id::text and payload -> 'data' ->> 'transactionId' = transaction_id::text",
+          "definition": "check (payload ->> 'eventId' = id::text and payload ->> 'eventType' = event_type and (payload ->> 'version')::int = event_version and payload ->> 'aggregateId' = aggregate_id::text and payload ->> 'correlationId' = correlation_id::text and payload -> 'data' ->> 'walletId' = message_group_id::text and payload -> 'data' ->> 'transactionId' = transaction_id::text)"
+        }
+      ],
+      "triggers": [
+        {
+          "name": "content_no_update",
+          "timing": "before",
+          "events": [
+            "update"
+          ],
+          "forEach": "row",
+          "body": "if (old.id, old.seq, old.transaction_id, old.aggregate_id, old.event_type, old.event_version, old.message_group_id, old.correlation_id, old.payload, old.occurred_at) is distinct from (new.id, new.seq, new.transaction_id, new.aggregate_id, new.event_type, new.event_version, new.message_group_id, new.correlation_id, new.payload, new.occurred_at) then raise exception 'outbox_messages: o conteúdo do evento é imutável'; end if; return new;"
+        }
+      ],
+      "foreignKeys": {
+        "outbox_messages_message_group_id_fk": {
+          "columnNames": [
+            "message_group_id"
+          ],
+          "constraintName": "outbox_messages_message_group_id_fk",
+          "localTableName": "public.outbox_messages",
+          "referencedColumnNames": [
+            "id"
+          ],
+          "referencedTableName": "public.wallets"
+        },
+        "outbox_messages_transaction_id_fk": {
+          "columnNames": [
+            "transaction_id"
+          ],
+          "constraintName": "outbox_messages_transaction_id_fk",
+          "localTableName": "public.outbox_messages",
+          "referencedColumnNames": [
+            "id"
+          ],
+          "referencedTableName": "public.wager_transactions"
+        }
+      },
+      "comment": null
+    },
+    {
       "name": "wager_transactions",
       "schema": "public",
       "columns": {
+        "correlation_id": {
+          "name": "correlation_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamptz(6)",

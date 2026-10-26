@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   DeadlockException,
   type EntityManager,
@@ -5,6 +6,8 @@ import {
   UniqueConstraintViolationException,
 } from '@mikro-orm/core';
 import type { MikroORM } from '@mikro-orm/postgresql';
+import { eventsForTransition } from '../../application/events/transaction-events';
+import { OutboxMessage } from '../../application/outbox/outbox-message';
 import {
   type ExistingSubmissions,
   type PendingReferenceRepository,
@@ -13,6 +16,7 @@ import {
   type ReferenceQuery,
   type ResolvedReference,
   type StoredSubmission,
+  type SubmissionContext,
   type SubmissionDecision,
   type SubmissionKeys,
   type SubmissionOutcome,
@@ -30,7 +34,12 @@ import { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
 import { WagerTransactionRecord } from '../schema/wager-transaction.schema';
 import { WalletRecord } from '../schema/wallet.schema';
-import { assertStorable, insertLedgerEntry, toTransactionRecord } from './persistence';
+import {
+  assertStorable,
+  insertLedgerEntry,
+  insertOutboxMessages,
+  toTransactionRecord,
+} from './persistence';
 
 /** Constraints que identificam a mesma submissão (corrida entre wallets diferentes). */
 const SUBMISSION_UNIQUES = new Set([
@@ -86,11 +95,20 @@ async function classifyFailures<T>(operation: () => Promise<T>): Promise<T> {
  * O worker de `PENDING_REFERENCE` (§7.1) usa a mesma ordem de locks: wallet, depois a transação
  * pendente, relida sob o lock. Duas tentativas da mesma transação se serializam na wallet, e a
  * segunda encontra o estado já gravado pela primeira.
+ *
+ * Outbox (§11): os eventos de cada decisão são derivados aqui, dentro da transação SQL, do estado
+ * anterior que a própria persistência conhece sob o lock — `PENDING` para a transação criada na
+ * submissão, o `PENDING_REFERENCE` relido no worker — e gravados no mesmo commit do estado, do saldo
+ * e do lançamento. Uma falha em qualquer gravação desfaz tudo; nada é publicado aqui.
  */
 export class MikroOrmWagerTransactionRepository
   implements WagerTransactionRepository, PendingReferenceRepository
 {
-  constructor(private readonly orm: MikroORM) {}
+  constructor(
+    private readonly orm: MikroORM,
+    /** Gera o `eventId` (id da linha da outbox) de cada evento. */
+    private readonly newEventId: () => string = randomUUID,
+  ) {}
 
   findExisting(keys: SubmissionKeys): Promise<ExistingSubmissions> {
     return classifyFailures(() => findExistingIn(this.orm.em.fork(), keys));
@@ -99,10 +117,13 @@ export class MikroOrmWagerTransactionRepository
   applyToLockedWallet(
     walletId: string,
     keys: SubmissionKeys,
+    context: SubmissionContext,
     decide: (wallet: Wallet, reference: ResolvedReference | null) => SubmissionDecision,
     reference?: ReferenceQuery,
   ): Promise<SubmissionOutcome> {
-    return classifyFailures(() => this.#applyToLockedWallet(walletId, keys, decide, reference));
+    return classifyFailures(() =>
+      this.#applyToLockedWallet(walletId, keys, context, decide, reference),
+    );
   }
 
   findDuePendingReferences(now: Date, limit: number): Promise<PendingReferenceTask[]> {
@@ -135,7 +156,7 @@ export class MikroOrmWagerTransactionRepository
 
         // Sob o lock da wallet, outro worker pode já ter concluído ou reagendado esta transação.
         const [pendingRow] = (await em.getConnection().execute(
-          `select ${TRANSACTION_COLUMNS}, t.reference_attempts
+          `select ${TRANSACTION_COLUMNS}, t.reference_attempts, t.correlation_id
              from wager_transactions t
             where t.id = ? and t.wallet_id = ? and t.status = 'PENDING_REFERENCE'
               and t.next_reference_attempt_at <= ?
@@ -143,7 +164,7 @@ export class MikroOrmWagerTransactionRepository
           [task.transactionId, task.walletId, now],
           'all',
           em.getTransactionContext(),
-        )) as (TransactionRow & { reference_attempts: number })[];
+        )) as (TransactionRow & { reference_attempts: number; correlation_id: string })[];
         if (pendingRow === undefined) return false;
 
         const pending = toTransaction(pendingRow);
@@ -185,6 +206,17 @@ export class MikroOrmWagerTransactionRepository
           );
         }
         if (ledgerEntry !== null) await applyMovement(em, row, wallet, ledgerEntry);
+        // Estado anterior e correlação vêm da linha relida sob o lock, não do chamador nem de
+        // `pending` (a mesma instância que `decide` acabou de alterar): um novo agendamento
+        // (PENDING_REFERENCE → PENDING_REFERENCE) não gera evento.
+        await this.#recordEvents(em, {
+          transaction,
+          previousStatus: pendingRow.status,
+          wallet,
+          ledgerEntry,
+          correlationId: pendingRow.correlation_id,
+          at: now,
+        });
         return true;
       }),
     );
@@ -224,9 +256,19 @@ export class MikroOrmWagerTransactionRepository
     );
   }
 
+  /** Eventos da transição gravados na outbox, na transação do `em`. */
+  #recordEvents(
+    em: EntityManager,
+    transition: Omit<Parameters<typeof eventsForTransition>[0], 'newId'>,
+  ): Promise<void> {
+    const events = eventsForTransition({ ...transition, newId: this.newEventId });
+    return insertOutboxMessages(em, events.map(OutboxMessage.enqueue));
+  }
+
   async #applyToLockedWallet(
     walletId: string,
     keys: SubmissionKeys,
+    context: SubmissionContext,
     decide: (wallet: Wallet, reference: ResolvedReference | null) => SubmissionDecision,
     referenceQuery: ReferenceQuery | undefined,
   ): Promise<SubmissionOutcome> {
@@ -258,6 +300,7 @@ export class MikroOrmWagerTransactionRepository
         em.create(
           WagerTransactionRecord,
           toTransactionRecord(transaction, row, wallet.balance, {
+            correlationId: context.correlationId,
             referenceTransaction:
               referenceId === undefined
                 ? null
@@ -268,6 +311,15 @@ export class MikroOrmWagerTransactionRepository
         await em.flush();
 
         if (ledgerEntry !== null) await applyMovement(em, row, wallet, ledgerEntry);
+        // A transação não existia antes desta submissão (conferido sob o lock): parte de PENDING.
+        await this.#recordEvents(em, {
+          transaction,
+          previousStatus: WagerTransactionStatus.Pending,
+          wallet,
+          ledgerEntry,
+          correlationId: context.correlationId,
+          at: context.decidedAt,
+        });
 
         return {
           kind: 'APPLIED',

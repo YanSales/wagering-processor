@@ -1,4 +1,5 @@
 import type { EntityManager } from '@mikro-orm/core';
+import type { OutboxMessage } from '../../application/outbox/outbox-message';
 import { AmountOutOfStorageRangeError } from '../../application/wallet-repository';
 import type { Money } from '../../domain/money';
 import type { WagerTransaction } from '../../domain/wager-transaction';
@@ -19,6 +20,8 @@ export function assertStorable(money: Money): void {
 
 /** Campos de persistência que o domínio não carrega. */
 export interface TransactionRecordExtras {
+  /** Correlação da operação que cria a transação; os eventos posteriores a reutilizam. */
+  correlationId: string;
   /** Linha da referência resolvida (o id interno vem de `transaction.referenceTransactionId`). */
   referenceTransaction?: WagerTransactionRecord | null;
   /** Próxima tentativa de resolução, somente em `PENDING_REFERENCE` (§7.1). */
@@ -33,7 +36,7 @@ export function toTransactionRecord(
   transaction: WagerTransaction,
   wallet: WalletRecord,
   resultBalance: Money | null,
-  extras: TransactionRecordExtras = {},
+  extras: TransactionRecordExtras,
 ): WagerTransactionRecord {
   return {
     id: transaction.id,
@@ -58,6 +61,7 @@ export function toTransactionRecord(
     referenceAttempts: 0,
     nextReferenceAttemptAt: extras.nextReferenceAttemptAt ?? null,
     processingFailures: 0,
+    correlationId: extras.correlationId,
     createdAt: transaction.createdAt,
     processedAt: transaction.processedAt ?? null,
   };
@@ -100,5 +104,45 @@ export async function insertLedgerEntry(
   } catch (error) {
     // O SQL cru não passa pelo conversor do ORM; converte para o mesmo tipo que o `flush` lança.
     throw em.getDriver().convertException(error as Error);
+  }
+}
+
+/**
+ * Grava os eventos na outbox, no contexto transacional do `em` (contrato §11): confirmados no mesmo
+ * commit da alteração financeira, ou desfeitos com ela. Nada é publicado aqui.
+ *
+ * Um `INSERT` por evento, na ordem recebida: o `seq` acompanha essa ordem (`Processed` antes de
+ * `WalletBalanceChanged`). `next_attempt_at` usa o relógio do banco, para que o evento fique elegível
+ * assim que for confirmado. O payload é o envelope serializado (`MoneyProps`, sem `bigint`); o `jsonb`
+ * preserva o conteúdo, não a ordem das chaves.
+ */
+export async function insertOutboxMessages(
+  em: EntityManager,
+  messages: readonly OutboxMessage[],
+): Promise<void> {
+  for (const message of messages) {
+    try {
+      await em.getConnection().execute(
+        `insert into "outbox_messages" ("id", "transaction_id", "aggregate_id", "event_type",
+           "event_version", "message_group_id", "correlation_id", "payload", "occurred_at",
+           "next_attempt_at")
+         values (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, now())`,
+        [
+          message.id,
+          message.transactionId,
+          message.aggregateId,
+          message.eventType,
+          message.eventVersion,
+          message.messageGroupId,
+          message.correlationId,
+          JSON.stringify(message.payload),
+          message.occurredAt,
+        ],
+        'run',
+        em.getTransactionContext(),
+      );
+    } catch (error) {
+      throw em.getDriver().convertException(error as Error);
+    }
   }
 }

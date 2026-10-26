@@ -37,6 +37,11 @@ export class WagerTransactionRecord {
    * zero quando uma tentativa é concluída.
    */
   processingFailures!: number;
+  /**
+   * Correlação da operação que criou a transação (gerada no servidor, por requisição). Os eventos
+   * gravados depois, pelo worker, reutilizam este valor em vez de gerar outro.
+   */
+  correlationId!: string;
   createdAt!: Date;
   processedAt!: Date | null;
 }
@@ -108,6 +113,7 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     referenceAttempts: { type: 'integer', default: 0 },
     nextReferenceAttemptAt: { type: 'timestamptz', nullable: true },
     processingFailures: { type: 'integer', default: 0 },
+    correlationId: { type: 'uuid' },
     createdAt: { type: 'timestamptz' },
     processedAt: { type: 'timestamptz', nullable: true },
   },

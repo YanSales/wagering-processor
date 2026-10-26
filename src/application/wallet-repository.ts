@@ -11,6 +11,8 @@ export interface OpenedWallet {
   wallet: Wallet;
   opening: WagerTransaction | null;
   openingEntry: WalletLedgerEntry | null;
+  /** Correlação da requisição de abertura, gravada na OPENING e nos eventos dela. */
+  correlationId: string;
 }
 
 /**
@@ -18,10 +20,11 @@ export interface OpenedWallet {
  */
 export interface WalletRepository {
   /**
-   * Grava a wallet aberta e, se houver, a OPENING e seu lançamento CREDIT numa única transação SQL:
-   * ou tudo é confirmado, ou nada. Lança `WalletAlreadyExistsError` se já existir wallet para o
-   * mesmo `playerId` + `currency`, e `AmountOutOfStorageRangeError`, antes de gravar, se algum valor
-   * não couber no armazenamento.
+   * Grava a wallet aberta e, se houver, a OPENING, seu lançamento CREDIT e os eventos da abertura na
+   * outbox (`WagerTransactionProcessed` e `WalletBalanceChanged`, §11) numa única transação SQL: ou
+   * tudo é confirmado, ou nada. Saldo inicial zero não grava evento. Lança `WalletAlreadyExistsError`
+   * se já existir wallet para o mesmo `playerId` + `currency`, e `AmountOutOfStorageRangeError`,
+   * antes de gravar, se algum valor não couber no armazenamento.
    */
   insertOpened(opened: OpenedWallet): Promise<void>;
 }

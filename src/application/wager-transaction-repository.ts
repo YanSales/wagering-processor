@@ -37,6 +37,14 @@ export interface ExistingSubmissions {
   byExternalTransaction: StoredSubmission | null;
 }
 
+/** Dados da operação de submissão que não fazem parte da transação de domínio. */
+export interface SubmissionContext {
+  /** Correlação da requisição, gravada na transação e nos eventos dela. */
+  correlationId: string;
+  /** Instante da decisão: `occurredAt` dos eventos de rejeição e de espera pela referência. */
+  decidedAt: Date;
+}
+
 /** Resultado de uma submissão decidido sobre a wallet travada, pronto para gravar. */
 export interface SubmissionDecision {
   /** Transação em `PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`. */
@@ -77,7 +85,11 @@ export interface WagerTransactionRepository {
   /**
    * Numa única transação SQL: trava a wallet contra escritas concorrentes de qualquer instância,
    * confere de novo se a submissão já existe (se existir, devolve `EXISTING` sem chamar `decide`),
-   * chama `decide` com a wallet travada e grava transação, saldo, versão e lançamento juntos.
+   * chama `decide` com a wallet travada e grava transação (com a correlação de `context`), saldo,
+   * versão, lançamento e os eventos de integração da decisão na outbox, juntos (§11).
+   *
+   * Os eventos são os da transição a partir de `PENDING` — a transação é nova, criada nesta
+   * submissão — e saem na outbox somente se tudo for confirmado. `EXISTING` não grava evento.
    *
    * Com `reference`, a transação referenciada é lida sob o mesmo lock e entregue a `decide` (`null`
    * se ainda não existir); sem ela, `decide` recebe `null`. Uma decisão `PENDING_REFERENCE` é gravada
@@ -85,13 +97,14 @@ export interface WagerTransactionRepository {
    *
    * Se outra submissão com as mesmas chaves for confirmada em paralelo (por outra wallet), devolve
    * `EXISTING` sem aplicar efeito. Lança `WalletNotFoundError` se a wallet não existir; outros erros
-   * desfazem a transação inteira.
+   * desfazem a transação inteira, eventos inclusive.
    *
    * Os dois métodos lançam `TransientPersistenceError` em falhas transitórias do banco.
    */
   applyToLockedWallet(
     walletId: string,
     keys: SubmissionKeys,
+    context: SubmissionContext,
     decide: (wallet: Wallet, reference: ResolvedReference | null) => SubmissionDecision,
     reference?: ReferenceQuery,
   ): Promise<SubmissionOutcome>;
@@ -124,6 +137,11 @@ export interface PendingReferenceRepository {
    * worker pode tê-la resolvido. Então chama `decide` com a referência lida sob o lock e grava
    * transação (tentativa contada), saldo, versão e lançamento juntos. A decisão pode ser `PROCESSED`,
    * `REJECTED` ou de novo `PENDING_REFERENCE`, com a próxima tentativa.
+   *
+   * No mesmo commit, grava na outbox os eventos da transição a partir do estado relido sob o lock
+   * (`PENDING_REFERENCE`), com a correlação gravada na submissão e `now` como instante da decisão:
+   * conclusão gera `Processed` (e `WalletBalanceChanged` se o saldo mudou) ou `Rejected`; um novo
+   * agendamento não gera evento.
    *
    * A transição gravada zera `processingFailures`: a quarentena termina junto com o commit dela.
    *

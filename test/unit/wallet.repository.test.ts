@@ -42,7 +42,7 @@ function opened(cents: bigint) {
     openedAt: NOW,
     opening: { transactionId: opening.id, ledgerEntryId: 'entry-1' },
   });
-  return { wallet, opening, openingEntry };
+  return { wallet, opening, openingEntry, correlationId: 'corr-1' };
 }
 
 describe('MikroOrmWalletRepository: faixa do bigint do PostgreSQL', () => {

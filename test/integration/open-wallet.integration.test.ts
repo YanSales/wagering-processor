@@ -300,8 +300,9 @@ describe('constraints existentes continuam valendo para a abertura', () => {
 
     await expect(
       sql(
-        `insert into wager_transactions (id, wallet_id, player_id, kind, status, money_cents, currency, created_at)
-         values (?, ?, ?, 'OPENING', 'PROCESSED', 100, 'BRL', now())`,
+        `insert into wager_transactions (id, wallet_id, player_id, kind, status, money_cents, currency,
+           correlation_id, created_at)
+         values (?, ?, ?, 'OPENING', 'PROCESSED', 100, 'BRL', gen_random_uuid(), now())`,
         [randomUUID(), wallet.id, playerId],
       ),
     ).rejects.toMatchObject({

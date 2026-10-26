@@ -28,11 +28,15 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
   limite, `REJECTED` com `REFERENCE_NOT_FOUND`. Falhas operacionais do worker (nem transitórias nem
   de negócio) entram em quarentena com backoff, sem consumir tentativas nem bloquear as demais
   pendências;
+- Transactional Outbox (gravação): os eventos de integração de cada operação
+  (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference`,
+  `WalletBalanceChanged`) são gravados em `outbox_messages` no mesmo commit da alteração
+  financeira, com a correlação da operação; as transações guardam essa correlação;
 - SQS FIFO local (ElasticMQ), com provisionamento da fila `wager-events.fifo` e de sua DLQ.
 
 Ainda **não há** processamento de WIN e LOSS com referência e ROLLBACK (a API responde 501),
-eventos de integração, Inbox/Outbox, publicação ou consumo de mensagens, consultas da API,
-autenticação (só o ponto de extensão) nem `GET /health/ready`.
+publicação dos eventos da outbox (nenhum evento sai do banco ainda), Inbox, consumo de mensagens,
+consultas da API, autenticação (só o ponto de extensão) nem `GET /health/ready`.
 Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md). Esta seção é atualizada a cada
 etapa concluída; nada é descrito como pronto antes de estar implementado e verificado.
 

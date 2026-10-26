@@ -13,6 +13,7 @@ import {
   type ReferenceQuery,
   type ResolvedReference,
   type StoredSubmission,
+  type SubmissionContext,
   type SubmissionDecision,
   type SubmissionKeys,
   type SubmissionOutcome,
@@ -43,6 +44,8 @@ class InMemoryWagerTransactionRepository implements WagerTransactionRepository {
   /** Transações decididas, para resolver referências como o banco faria. */
   readonly transactions: WagerTransaction[] = [];
   readonly schedules = new Map<string, Date>();
+  /** Contexto recebido em cada chamada a `applyToLockedWallet`. */
+  readonly contexts: SubmissionContext[] = [];
   decideCalls = 0;
 
   resolve(query: ReferenceQuery): ResolvedReference | null {
@@ -88,9 +91,11 @@ class InMemoryWagerTransactionRepository implements WagerTransactionRepository {
   async applyToLockedWallet(
     walletId: string,
     keys: SubmissionKeys,
+    context: SubmissionContext,
     decide: (wallet: Wallet, reference: ResolvedReference | null) => SubmissionDecision,
     query?: ReferenceQuery,
   ): Promise<SubmissionOutcome> {
+    this.contexts.push(context);
     const state = this.wallets.get(walletId);
     if (state === undefined) throw new WalletNotFoundError(walletId);
     const existing = await this.findExisting(keys);
@@ -129,10 +134,13 @@ class InMemoryWagerTransactionRepository implements WagerTransactionRepository {
 function setup() {
   const repository = new InMemoryWagerTransactionRepository();
   let sequence = 0;
+  let correlations = 0;
   const useCase = new SubmitWagerTransaction(
     repository,
     () => T0,
     () => `id-${++sequence}`,
+    undefined,
+    () => `corr-${++correlations}`,
   );
   return { repository, useCase };
 }
@@ -271,6 +279,45 @@ describe('SubmitWagerTransaction: idempotência', () => {
     );
     expect(repository.entries).toHaveLength(1);
     expect(repository.decideCalls).toBe(1);
+  });
+});
+
+describe('SubmitWagerTransaction: correlação', () => {
+  test('cada submissão nova leva uma correlação própria e o instante da decisão', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+
+    await useCase.execute(bet());
+    await useCase.execute(
+      bet({ idempotencyKey: 'provider-a:tx-2', externalTransactionId: 'tx-2' }),
+    );
+
+    expect(repository.contexts).toEqual([
+      { correlationId: 'corr-1', decidedAt: T0 },
+      { correlationId: 'corr-2', decidedAt: T0 },
+    ]);
+  });
+
+  test('a correlação não é derivada da chave de idempotência', async () => {
+    const repository = new InMemoryWagerTransactionRepository();
+    repository.addWallet(10_000n);
+    const useCase = new SubmitWagerTransaction(repository, () => T0);
+
+    await useCase.execute(bet());
+
+    const [context] = repository.contexts;
+    expect(context?.correlationId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(context?.correlationId).not.toContain('tx-1');
+  });
+
+  test('replay não chega à persistência transacional: nenhuma correlação nova', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+    await useCase.execute(bet());
+
+    await useCase.execute(bet());
+
+    expect(repository.contexts).toHaveLength(1);
   });
 });
 

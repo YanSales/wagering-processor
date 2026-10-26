@@ -33,11 +33,20 @@ function setup() {
     repository,
     () => NOW,
     () => `id-${++sequence}`,
+    () => 'corr-1',
   );
   return { repository, useCase };
 }
 
 describe('OpenWallet', () => {
+  test('a correlação gerada para a abertura segue para a persistência', async () => {
+    const { repository, useCase } = setup();
+
+    await useCase.execute({ playerId: 'player-1', initialBalance: brl(100n) });
+
+    expect(repository.saved[0]?.correlationId).toBe('corr-1');
+  });
+
   test('saldo inicial zero: só a wallet, sem OPENING nem lançamento', async () => {
     const { repository, useCase } = setup();
 

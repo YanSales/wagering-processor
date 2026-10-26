@@ -96,8 +96,9 @@ async function insertTransaction(row: TransactionRow) {
   await sql(
     `insert into wager_transactions (id, wallet_id, player_id, kind, status, provider_id, external_transaction_id,
        idempotency_key, payload_hash, round_id, game_id, money_cents, currency, reference_external_transaction_id,
-       reference_transaction_id, failure_code, result_balance_cents, next_reference_attempt_at, created_at)
-       values (?, ?, 'player-x', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())`,
+       reference_transaction_id, failure_code, result_balance_cents, next_reference_attempt_at, correlation_id,
+       created_at)
+       values (?, ?, 'player-x', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, gen_random_uuid(), now())`,
     [
       id,
       row.walletId,
@@ -618,13 +619,16 @@ describe('migration e comparação de schema', () => {
       const objects = async () => {
         const [row] = await sql(
           `select (select count(*) from information_schema.tables where table_schema = 'public'
-                     and table_name in ('wallets', 'wager_transactions', 'wallet_ledger_entries'))::int as tables,
-                  (select count(*) from pg_proc where proname like 'wallet_ledger_entries_%_fn')::int as functions,
+                     and table_name in ('wallets', 'wager_transactions', 'wallet_ledger_entries',
+                                        'outbox_messages'))::int as tables,
+                  (select count(*) from pg_proc
+                    where proname in ('wallet_ledger_entries_ledger_no_update_delete_fn',
+                                      'outbox_messages_content_no_update_fn'))::int as functions,
                   (select count(*) from pg_trigger where not tgisinternal)::int as triggers`,
         );
         return row;
       };
-      expect(await objects()).toEqual({ tables: 3, functions: 1, triggers: 1 });
+      expect(await objects()).toEqual({ tables: 4, functions: 2, triggers: 2 });
       const executed = (await orm.migrator.getExecuted()).map((m) => m.name);
       expect(executed.some((name) => name.endsWith('_financial_schema'))).toBe(true);
 
@@ -635,7 +639,7 @@ describe('migration e comparação de schema', () => {
 
       const reapplied = await orm.migrator.up();
       expect(reapplied.map((m) => m.name)).toEqual(executed);
-      expect(await objects()).toEqual({ tables: 3, functions: 1, triggers: 1 });
+      expect(await objects()).toEqual({ tables: 4, functions: 2, triggers: 2 });
     },
     DATABASE_BOOTSTRAP_TIMEOUT_MS,
   );

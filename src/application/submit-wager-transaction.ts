@@ -72,6 +72,8 @@ export class SubmitWagerTransaction {
     private readonly referenceRetry: ReferenceRetryPolicy = ReferenceRetryPolicy.from(
       DEFAULT_REFERENCE_RETRY,
     ),
+    /** Correlação de cada submissão nova: gerada no servidor, nunca derivada da chave de idempotência. */
+    private readonly newCorrelationId: () => string = randomUUID,
   ) {}
 
   async execute(command: SubmitWagerTransactionCommand): Promise<SubmissionResult> {
@@ -105,12 +107,15 @@ export class SubmitWagerTransaction {
       createdAt: at,
     });
     const ledgerEntryId = this.newId();
+    // Gravada na transação e nos eventos dela; um replay devolve o resultado sem usá-la.
+    const context = { correlationId: this.newCorrelationId(), decidedAt: at };
 
     const outcome =
       command.kind === WagerTransactionKind.Refund
         ? await this.transactions.applyToLockedWallet(
             command.walletId,
             keys,
+            context,
             (wallet, reference) =>
               decideRefund({
                 transaction,
@@ -127,7 +132,7 @@ export class SubmitWagerTransaction {
               reversalKind: WagerTransactionKind.Refund,
             },
           )
-        : await this.transactions.applyToLockedWallet(command.walletId, keys, (wallet) => {
+        : await this.transactions.applyToLockedWallet(command.walletId, keys, context, (wallet) => {
             const apply = MOVEMENTS[command.kind as MovementKind];
             try {
               const ledgerEntry = apply({ transaction, wallet, ledgerEntryId, at });

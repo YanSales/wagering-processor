@@ -1,4 +1,5 @@
 import type { Options } from '@mikro-orm/postgresql';
+import { OutboxMessageSchema } from './schema/outbox-message.schema';
 import { WagerTransactionSchema } from './schema/wager-transaction.schema';
 import { WalletSchema } from './schema/wallet.schema';
 import { WalletLedgerEntrySchema } from './schema/wallet-ledger-entry.schema';
@@ -14,4 +15,5 @@ export const entities: NonNullable<Options['entities']> = [
   WalletSchema,
   WagerTransactionSchema,
   WalletLedgerEntrySchema,
+  OutboxMessageSchema,
 ];

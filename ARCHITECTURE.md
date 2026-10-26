@@ -104,7 +104,8 @@ justificados aqui.
 
 - Todo lançamento do ledger usa o mesmo caminho de gravação, dentro da transação da operação.
 - Nenhuma chamada externa (SQS, HTTP) dentro de uma transação de banco. Eventos só depois do
-  commit, por Outbox transacional (exigências do contrato, §5.4 e §11; ainda não implementado).
+  commit, por Outbox transacional (exigências do contrato, §5.4 e §11): a gravação na outbox já
+  existe (seção "Transactional Outbox"); a publicação ainda não.
 
 ### Pendente
 
@@ -289,7 +290,7 @@ SQS.
   `money:` embora a causa seja o saldo resultante.
 - **Reutilização**: `POST /wagering/transactions` já chama este caso de uso; o consumidor SQS deverá
   chamar o mesmo `SubmitWagerTransaction`, com a chave de idempotência da mensagem. O consumidor
-  ainda precisará da Inbox e do Outbox na mesma transação (§6.5), que não existem.
+  ainda precisará da Inbox na mesma transação (§6.5), que não existe; a Outbox já é gravada nela.
 
 ## Referências fora de ordem: `PENDING_REFERENCE` e o worker agendado (contrato §7.1)
 
@@ -394,9 +395,10 @@ observado ao aceitar). O reenvio devolve o estado atual gravado: 202 enquanto pe
 resultado terminal (200 ou 422) com o saldo observado na conclusão. Conflito de payload e operação
 externa duplicada seguem iguais.
 
-**Eventos** (§7.1 e §11: `WagerTransactionPendingReference` e o `WagerTransactionRejected` do
-esgotamento): **não publicados**, decisão aprovada. Não há Outbox, e nenhuma operação publica
-eventos ainda; os eventos entram todos juntos com a Outbox transacional.
+**Eventos** (§7.1 e §11): a entrada em `PENDING_REFERENCE` grava `WagerTransactionPendingReference`
+na outbox; um novo agendamento não grava nada; a resolução grava `WagerTransactionProcessed` e
+`WalletBalanceChanged`, e o esgotamento, `WagerTransactionRejected` (`REFERENCE_NOT_FOUND`), cada um
+no mesmo commit da transição (seção "Transactional Outbox"). Ainda **não publicados**.
 
 **Testes**: `test/integration/pending-reference.integration.test.ts`. Cobre:
 
@@ -554,6 +556,123 @@ simultâneas vão a uma única instância da aplicação; o cenário com process
 entre endpoints (§9) fica pendente. Um header `Idempotency-Key` repetido chega ao Node como valores
 unidos por vírgula e é aceito como uma única chave.
 
+## Transactional Outbox (contrato §6.5 e §11)
+
+**O que existe**: a gravação. Cada decisão financeira grava seus eventos de integração em
+`outbox_messages` **na mesma transação SQL** que grava a transação, o saldo, a versão e o
+lançamento. Ou tudo é confirmado no mesmo commit, ou nada. **O que ainda não existe**: o publisher
+(leitura dos pendentes, lease, envio para `wager-events.fifo`, retry) e qualquer consumidor dos
+eventos. Nenhum evento é publicado hoje.
+
+**Por que na mesma transação**: publicar antes do commit poderia anunciar uma alteração desfeita
+depois; publicar depois do commit, sem registro, perderia o evento se o processo morresse entre os
+dois passos (§11, cenário obrigatório). Com a outbox, o commit que confirma a alteração confirma
+também o evento, que fica persistido para o publisher mesmo que o processo termine logo em seguida.
+
+**Eventos por operação** (contratos e fábricas do incremento anterior, `src/application/events/`):
+
+| Situação                                                     | Eventos gravados                                                                     |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| BET, WIN ou REFUND aplicados                                 | `WagerTransactionProcessed` + `WalletBalanceChanged`                                 |
+| LOSS aplicado                                                | `WagerTransactionProcessed`                                                          |
+| Rejeição de negócio (na submissão ou no worker)              | `WagerTransactionRejected`                                                           |
+| Entrada em `PENDING_REFERENCE` (só na submissão)             | `WagerTransactionPendingReference`                                                   |
+| Novo agendamento de uma pendência                            | nenhum                                                                               |
+| Pendência resolvida                                          | `WagerTransactionProcessed` + `WalletBalanceChanged`                                 |
+| Abertura com saldo positivo                                  | `WagerTransactionProcessed` (OPENING) + `WalletBalanceChanged` (0 → saldo, versão 1) |
+| Abertura com saldo zero, replay, conflito, falha transitória | nenhum                                                                               |
+
+ROLLBACK continua recusado na submissão; nenhuma regra nova foi criada para ele.
+
+**Onde os eventos são derivados**: nos repositórios, dentro da transação, por `eventsForTransition`
+e `eventsForWalletOpening`. O estado anterior não vem do chamador: na submissão, a transação é
+criada naquela mesma transação SQL (conferido sob o lock da wallet), então parte de `PENDING`; no
+worker, é o `PENDING_REFERENCE` da linha relida com `FOR UPDATE`. Por isso um novo agendamento não
+repete o evento de espera. O estado anterior é lido da linha crua, não do objeto de domínio, que a
+decisão altera.
+
+**Schema** (`Migration20261026135325_outbox_messages`):
+
+- `id` = `eventId` do envelope; `payload` (`jsonb`) = envelope completo de `toJSON()`, com valores
+  em `MoneyProps` (texto decimal, sem `bigint`); `jsonb` preserva o conteúdo, não a ordem das chaves.
+- `transaction_id` (FK) é a transação de origem, inclusive de `WalletBalanceChanged`, cujo
+  `aggregate_id` é a wallet; `message_group_id` (FK) é a wallet, futuro `MessageGroupId`.
+- `UNIQUE (transaction_id, event_type)`: cada tipo sai no máximo uma vez por transação (estados
+  terminais, um lançamento por transação, espera só na entrada). É defesa adicional: ela recusa uma
+  duplicata, mas não detecta um evento omitido; a transição certa vem da leitura sob o lock.
+- CHECK de coerência entre o envelope e as colunas (`eventId`, `eventType`, `version`,
+  `aggregateId`, `correlationId`, `walletId` e `transactionId` do `data`).
+- Imutabilidade: trigger `content_no_update` recusa UPDATE das colunas de conteúdo; `attempts`,
+  `next_attempt_at`, `claimed_until`, `claim_token`, `published_at` e `last_error_code` continuam
+  atualizáveis, para o publisher. Linhas publicadas são mantidas; DELETE não é bloqueado.
+- Índices parciais de não publicados: por vencimento (`next_attempt_at`, `seq`) e por wallet
+  (`message_group_id`, `seq`).
+
+**Correlação**: cada execução de `SubmitWagerTransaction` e `OpenWallet` gera um `correlationId`
+no servidor (UUID; sem header de entrada, sem derivar da chave de idempotência), gravado em
+`wager_transactions.correlation_id` e em todos os eventos daquela operação. O worker não gera outra:
+os eventos da resolução ou do esgotamento usam a correlação gravada na submissão. A migration
+preencheu as transações já existentes com uma correlação nova e tornou a coluna obrigatória; assim
+não há linha sem correlação para o worker tratar.
+
+**Transações anteriores à migration**: o UUID atribuído pela migration é sintético. Ele permite
+correlacionar de forma consistente os eventos gerados a partir da migration, mas não recupera a
+correlação original da submissão, que nunca foi gravada. Transações que já estavam em
+`PENDING_REFERENCE` antes da migration não recebem retroativamente um evento
+`WagerTransactionPendingReference`; se forem resolvidas ou esgotadas depois, os novos eventos usam a
+correlação persistida pela migration.
+
+**Entrega futura: at-least-once**. O publisher só poderá marcar o evento como publicado depois de o
+SQS aceitá-lo; se cair entre o envio e a marcação, o evento será reenviado. Por isso o evento é
+gravado uma vez, com `eventId` fixo, e toda republicação envia o mesmo envelope: o consumidor
+reconhece a duplicata pelo `eventId`. FIFO com deduplicação não torna isso exactly-once (a janela
+de deduplicação do SQS é limitada).
+
+**Ordenação**: `seq` é uma sequência auxiliar, não uma garantia global da ordem dos commits: os
+valores da sequência são obtidos fora do controle transacional, então transações concorrentes podem
+fazer commit em ordem diferente da de seus números. **Por wallet**, `seq` acompanha a ordem de
+commit, mas a garantia é **condicional**: decorre da exclusividade por wallet mantida até o commit,
+não da sequência. Nas operações sobre wallets existentes (submissão e worker), os eventos são
+gravados enquanto a wallet está bloqueada com `FOR UPDATE`, lock mantido até o commit; na abertura,
+os eventos são gravados na mesma transação que cria a wallet, antes de ela ficar visível para outras
+transações. Em todos esses caminhos, `seq` só é obtido no `INSERT` da outbox, depois da
+exclusividade; assim, a próxima transação da wallet só obtém números depois do commit da anterior.
+Dentro de uma transação, `Processed` vem antes de `WalletBalanceChanged`.
+
+A garantia por wallet depende destas premissas, que nem o banco nem o código impõem por completo:
+
+- **Exclusividade antes da gravação**: todo novo caminho que grave na outbox deve obter a
+  exclusividade da wallet (`FOR UPDATE` da wallet, ou criá-la na mesma transação) antes do primeiro
+  `INSERT`, e mantê-la até o commit. `insertOutboxMessages` não verifica isso. Um `INSERT` sem lock
+  obtém o `seq` antes de esperar pela wallet e pode ser confirmado depois de eventos com `seq` maior.
+- **`CACHE 1`**: premissa necessária. Com cache maior, cada sessão pré-aloca um bloco de valores, e
+  uma sessão com um bloco mais antigo pode gravar, depois do commit de outra, um `seq` menor, mesmo
+  com o lock da wallet. É o padrão do PostgreSQL para `bigserial`, conferido pelo teste de integração
+  da outbox; não substitui o protocolo de locks nem garante ordem global de commits.
+- **`seq` nunca explícito**: a coluna (`bigserial`) aceita valor fornecido no `INSERT`; os caminhos
+  de gravação omitem a coluna, e o trigger de imutabilidade só bloqueia `UPDATE`.
+- **Sem perda do lock por savepoint**: o PostgreSQL pode perder o lock de uma linha travada e depois
+  modificada num savepoint desfeito por `ROLLBACK TO SAVEPOINT`. Hoje não há savepoint entre a
+  aquisição do lock e a gravação; uma chamada dentro de transação externa (por exemplo, o futuro
+  consumidor com Inbox) precisa preservar isso.
+- **Sequência não reiniciada nem redefinida**: `setval`, `ALTER SEQUENCE … RESTART`, `CYCLE` ou uma
+  restauração parcial podem invalidar a monotonicidade esperada.
+
+**Entre wallets**, `seq` não indica ordem de commit, e não precisa. A ordem de `seq` também não
+garante, por si só, a ordem de publicação no SQS FIFO; isso dependerá do publisher, que ainda não
+existe: enviar os eventos de cada wallet em ordem de `seq`, só liberar um evento de uma wallet
+quando os anteriores dela já tiverem sido publicados e publicar com `MessageGroupId = walletId`.
+
+**Testes** (`test/integration/outbox.integration.test.ts`, PostgreSQL real): envelope persistido e
+coerente com as colunas; eventos por operação (BET, WIN, LOSS, REFUND, rejeição, abertura positiva
+e zero); entrada em espera, novo agendamento sem evento, resolução com a correlação original e
+esgotamento; falha transitória sem evento; sequência de SQL de uma submissão (`begin`, transação,
+saldo, ledger, dois eventos, `commit`); falha na outbox desfaz transação, saldo e ledger (submissão,
+worker e abertura); falha no ledger ou no estado não deixa evento órfão; constraints e trigger;
+entrega duplicada concorrente com um efeito e dois eventos; `seq` coerente com a ordem de commit
+numa wallet; wallets independentes; sequência de `seq` com `CACHE 1`; migration revertida e
+reaplicada preenchendo a correlação.
+
 ## Decisões, trade-offs e limitações (contrato §14)
 
 - **SQS local com ElasticMQ, não LocalStack/MiniStack**: o §4 cita LocalStack ou MiniStack. O
@@ -585,9 +704,10 @@ unidos por vírgula e é aceito como uma única chave.
 
 ## Ainda não implementado
 
-WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), eventos de `PENDING_REFERENCE` e do
-esgotamento (§7.1 e §11, com a Outbox), Inbox/Outbox, consumo SQS, retry e DLQ (§6.5, §10 e §11),
+WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), publicação da Outbox (publisher, lease,
+retry e `wager-events.fifo`), Inbox, consumo SQS, retry e DLQ da entrada (§6.5, §10 e §11),
 consultas e reconciliação pela API (`GET /wallets/:id`, ledger, transações), autenticação real
-(§2), observabilidade (§12: métricas) e `GET /health/ready`. Política terminal (`FAILED`) para falhas
-operacionais persistentes do worker: decisão pendente (hoje, quarentena sem fim). Enquanto os eventos
-não forem publicados, o contrato não está completo.
+(§2), observabilidade (§12: métricas, inclusive outbox lag) e `GET /health/ready`. Política terminal
+(`FAILED`) para falhas operacionais persistentes do worker: decisão pendente (hoje, quarentena sem
+fim). Os eventos já são gravados na outbox, mas, enquanto não forem publicados, o contrato não está
+completo.
