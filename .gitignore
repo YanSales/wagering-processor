@@ -24,3 +24,7 @@ coverage/
 .vscode/
 .DS_Store
 Thumbs.db
+
+CLAUDE.md
+biome.json.bak
+settings.json
