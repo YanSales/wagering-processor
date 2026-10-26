@@ -11,7 +11,7 @@ aqui descreve como existente o que ainda não foi implementado e testado.
   MikroORM ou SDKs (contrato §6.1).
 - `src/application/`: casos de uso e portas (ex.: `OpenWallet`, `WalletRepository`).
 - `src/database/`: schema, migrations e implementações MikroORM das portas.
-- `src/wallets/`, `src/health/`, `src/auth/`: borda HTTP (NestJS). Controllers só leem a entrada,
+- `src/wallets/`, `src/wagering/`, `src/health/`, `src/auth/`: borda HTTP (NestJS). Controllers só leem a entrada,
   chamam o caso de uso e traduzem o resultado para HTTP.
 
 ## Autenticação (contrato §2)
@@ -24,7 +24,8 @@ no código.
 
 - `AuthGuard` (`src/auth/auth.guard.ts`), registrado como guard global pelo `AuthModule`
   (`APP_GUARD` com `useExisting: AuthGuard`). **Ele aceita todas as requisições e não identifica
-  quem chama.** Nenhum endpoint está protegido, inclusive `POST /wallets`.
+  quem chama.** Nenhum endpoint está protegido, inclusive `POST /wallets` e
+  `POST /wagering/transactions`.
 - A aplicação registra no log, na inicialização, o aviso
   `Autenticação desativada: o AuthGuard global aceita todas as requisições`.
 - `@Public()` (`src/auth/public.decorator.ts`) marca as rotas que nunca exigirão autenticação. Hoje
@@ -190,7 +191,7 @@ contra o mesmo PostgreSQL, que é quem garante a serialização.
 ## Processamento de BET e idempotência (contrato §7 e §9)
 
 Caso de uso `SubmitWagerTransaction` (`src/application/submit-wager-transaction.ts`). Nesta etapa só
-processa `BET`; não há endpoint HTTP nem consumidor SQS.
+processa `BET`. Exposto por `POST /wagering/transactions` (seção seguinte); não há consumidor SQS.
 
 - **Regras** (domínio, `applyBet`): débito com um lançamento `DEBIT` e transação `PROCESSED`; saldo
   insuficiente, moeda diferente da wallet ou wallet de outro player → `REJECTED`, sem lançamento e
@@ -221,9 +222,70 @@ processa `BET`; não há endpoint HTTP nem consumidor SQS.
   `LOSS`, `REFUND`, `ROLLBACK`, BET de valor `0.00`, BET com `referenceExternalTransactionId`
   (`UnsupportedSubmissionError`); wallet inexistente (`WalletNotFoundError`; a FK impede gravar a
   transação).
-- **Reutilização futura**: `POST /wagering/transactions` e o consumidor SQS chamarão o mesmo
-  `SubmitWagerTransaction`, com a `Idempotency-Key` do header ou da mensagem. O consumidor ainda
-  precisará da Inbox e do Outbox na mesma transação (§6.5), que não existem.
+- **Reutilização**: `POST /wagering/transactions` já chama este caso de uso; o consumidor SQS deverá
+  chamar o mesmo `SubmitWagerTransaction`, com a chave de idempotência da mensagem. O consumidor
+  ainda precisará da Inbox e do Outbox na mesma transação (§6.5), que não existem.
+
+## API de submissão de transações (contrato §9)
+
+`POST /wagering/transactions` (`src/wagering/`). O controller lê o header e o corpo, chama
+`SubmitWagerTransaction` (injetado pelo `WageringModule`, com o repositório MikroORM) e traduz o
+resultado. Não acessa o banco, não move saldo, não cria lançamento e não guarda nada em memória.
+
+**Entrada.** Header `Idempotency-Key` obrigatório (string não vazia; a forma
+`{providerId}:{externalTransactionId}` é a recomendada pelo contrato, não exigida). Corpo com
+`providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind` e
+`money: { amount, currency }`; `referenceExternalTransactionId` opcional. Validação manual, sem
+dependência nova (`src/wagering/submit-transaction.request.ts`): strings não vazias e sem NUL,
+`walletId` UUID (a coluna é `uuid`), `kind` entre `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK`
+(`OPENING` é interno, §6.3). `money` é lido por `Money.fromProps`: string decimal com exatamente 2
+casas, não negativa, moeda ISO-4217, convertida direto para centavos `bigint`, sem passar por
+`number`. Campos extras são ignorados.
+
+**Saída.** Resultado gravado: `{ transactionId, status, balance, idempotentReplay }` (§9), mais
+`failureCode` quando `REJECTED` (§7.2). `balance` é o saldo observado ao concluir.
+
+**Mapeamento HTTP** (o §9 deixa a escolha ao candidato, desde que as situações sejam distintas e
+consistentes):
+
+| Situação                                                                                    | Status | Corpo                                              |
+| ------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------- |
+| `PROCESSED`, nova ou replay                                                                 | 200    | resultado                                          |
+| `REJECTED` (saldo, moeda, player), nova ou replay                                           | 422    | resultado, com `failureCode`                       |
+| Payload inválido, JSON malformado, `Idempotency-Key` ausente/vazia, valor acima do `bigint` | 400    | erro `INVALID_REQUEST`                             |
+| Wallet inexistente                                                                          | 404    | erro `WALLET_NOT_FOUND`                            |
+| Mesma chave com outro payload                                                               | 409    | erro `IDEMPOTENCY_KEY_CONFLICT`                    |
+| Mesma operação externa com outra chave                                                      | 409    | erro `DUPLICATE_EXTERNAL_TRANSACTION`              |
+| WIN, LOSS, REFUND, ROLLBACK, BET de valor zero, BET com referência                          | 501    | erro `UNSUPPORTED_SUBMISSION`                      |
+| Falha transitória do banco                                                                  | 503    | erro `TRANSIENT_FAILURE`                           |
+| Qualquer outro erro                                                                         | 500    | `{ statusCode, message: "Internal server error" }` |
+
+Corpo de erro: `{ statusCode, error, message, code }`, com `code` estável para o provedor decidir sem
+ler a mensagem. A rejeição de negócio usa o corpo do resultado, não o de erro: ela foi gravada e é
+devolvida igual no replay. O replay mantém o status original (200 ou 422). Nenhuma resposta inclui
+stack, SQL ou a chave de idempotência de outra submissão.
+
+**Falha transitória.** O repositório converte para `TransientPersistenceError` os SQLSTATEs `08xxx`,
+`40001`, `40P01`, `57P01`–`57P03`, `53300`, `55P03` e os erros de socket `ECONNREFUSED`,
+`ECONNRESET`, `ETIMEDOUT`, `EPIPE`. O resto é 500. Repetir após 503 é seguro: nada foi confirmado
+ou o resultado confirmado volta como replay.
+
+**Idempotência.** O header vai como `idempotencyKey` do caso de uso; replay, conflito e operação
+duplicada são os do caso de uso e do PostgreSQL (seção anterior). Testado por HTTP, inclusive com
+requisições equivalentes simultâneas e com o replay respondido por outra instância da aplicação
+iniciada depois.
+
+**Testes** (`test/integration/wagering-transactions.http.integration.test.ts`, `AppModule` real e
+PostgreSQL de teste): BET aplicada e rejeitada, replays, conflitos, cenário obrigatório 80/80
+sobre 100 por HTTP (200 e 422, saldo `20.00`, um débito; reentrega sem débito novo), dez BETs
+simultâneas, entradas inválidas sem efeito e falhas sem vazamento. As requisições simultâneas vão a
+uma única instância da aplicação; o cenário com processos independentes está em
+`bet-processing.integration.test.ts`.
+
+**Limitações.** `PENDING_REFERENCE` (aceite pendente, previsto como 202) não é produzido nesta etapa.
+`POST /wallets` ainda usa o corpo de erro padrão do Nest, sem `code`: a consistência do formato
+entre endpoints (§9) fica pendente. Um header `Idempotency-Key` repetido chega ao Node como valores
+unidos por vírgula e é aceito como uma única chave.
 
 ## Decisões, trade-offs e limitações (contrato §14)
 
@@ -250,6 +312,7 @@ processa `BET`; não há endpoint HTTP nem consumidor SQS.
 
 ## Ainda não implementado
 
-`POST /wagering/transactions` e o mapeamento HTTP dos resultados, processamento de WIN, LOSS, REFUND
-e ROLLBACK, `PENDING_REFERENCE` e seu worker (§7.1), Inbox/Outbox, consumo SQS, retry e DLQ (§6.5,
-§10 e §11), consultas e reconciliação pela API, observabilidade (§12) e `GET /health/ready`.
+Processamento de WIN, LOSS, REFUND e ROLLBACK, `PENDING_REFERENCE` e seu worker (§7.1),
+Inbox/Outbox, consumo SQS, retry e DLQ (§6.5, §10 e §11), consultas e reconciliação pela API
+(`GET /wallets/:id`, ledger, transações), autenticação real (§2), observabilidade (§12) e
+`GET /health/ready`.

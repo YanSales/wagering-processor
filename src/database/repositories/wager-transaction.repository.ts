@@ -1,4 +1,9 @@
-import { type EntityManager, LockMode, UniqueConstraintViolationException } from '@mikro-orm/core';
+import {
+  DeadlockException,
+  type EntityManager,
+  LockMode,
+  UniqueConstraintViolationException,
+} from '@mikro-orm/core';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import {
   type ExistingSubmissions,
@@ -6,6 +11,7 @@ import {
   type SubmissionDecision,
   type SubmissionKeys,
   type SubmissionOutcome,
+  TransientPersistenceError,
   type WagerTransactionRepository,
   WalletNotFoundError,
 } from '../../application/wager-transaction-repository';
@@ -23,6 +29,41 @@ const SUBMISSION_UNIQUES = new Set([
 ]);
 
 /**
+ * SQLSTATEs transitórios: serialização e deadlock (`40001`, `40P01`), servidor encerrando ou ainda
+ * indisponível (`57P01`–`57P03`), conexões esgotadas (`53300`) e lock indisponível (`55P03`). A classe
+ * `08` (conexão) é tratada inteira.
+ */
+const TRANSIENT_SQLSTATES = new Set([
+  '40001',
+  '40P01',
+  '57P01',
+  '57P02',
+  '57P03',
+  '53300',
+  '55P03',
+]);
+/** Erros de socket do Node ao falar com o banco. */
+const TRANSIENT_SOCKET_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE']);
+
+/** `true` se a falha é transitória e a operação pode ser repetida. Na dúvida, não é. */
+export function isTransientPersistenceFailure(error: unknown): boolean {
+  if (error instanceof DeadlockException) return true;
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code !== 'string') return false;
+  return code.startsWith('08') || TRANSIENT_SQLSTATES.has(code) || TRANSIENT_SOCKET_CODES.has(code);
+}
+
+/** Converte falhas transitórias para o erro da porta; as demais seguem inalteradas. */
+async function classifyFailures<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isTransientPersistenceFailure(error)) throw new TransientPersistenceError({ cause: error });
+    throw error;
+  }
+}
+
+/**
  * `WagerTransactionRepository` sobre MikroORM/PostgreSQL.
  *
  * Concorrência: lock pessimista da linha da wallet (`SELECT … FOR UPDATE`, `LockMode.PESSIMISTIC_WRITE`)
@@ -36,10 +77,18 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
   constructor(private readonly orm: MikroORM) {}
 
   findExisting(keys: SubmissionKeys): Promise<ExistingSubmissions> {
-    return findExistingIn(this.orm.em.fork(), keys);
+    return classifyFailures(() => findExistingIn(this.orm.em.fork(), keys));
   }
 
-  async applyToLockedWallet(
+  applyToLockedWallet(
+    walletId: string,
+    keys: SubmissionKeys,
+    decide: (wallet: Wallet) => SubmissionDecision,
+  ): Promise<SubmissionOutcome> {
+    return classifyFailures(() => this.#applyToLockedWallet(walletId, keys, decide));
+  }
+
+  async #applyToLockedWallet(
     walletId: string,
     keys: SubmissionKeys,
     decide: (wallet: Wallet) => SubmissionDecision,

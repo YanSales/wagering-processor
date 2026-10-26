@@ -60,12 +60,26 @@ export interface WagerTransactionRepository {
    * Se outra submissão com as mesmas chaves for confirmada em paralelo (por outra wallet), devolve
    * `EXISTING` sem aplicar efeito. Lança `WalletNotFoundError` se a wallet não existir; outros erros
    * desfazem a transação inteira.
+   *
+   * Os dois métodos lançam `TransientPersistenceError` em falhas transitórias do banco.
    */
   applyToLockedWallet(
     walletId: string,
     keys: SubmissionKeys,
     decide: (wallet: Wallet) => SubmissionDecision,
   ): Promise<SubmissionOutcome>;
+}
+
+/**
+ * Falha transitória da persistência (conexão, deadlock, serialização, servidor indisponível). Nada
+ * foi confirmado; repetir a mesma submissão é seguro, porque a idempotência é persistente.
+ */
+export class TransientPersistenceError extends Error {
+  override readonly name = 'TransientPersistenceError';
+
+  constructor(options: ErrorOptions) {
+    super('Falha transitória da persistência; a operação pode ser repetida.', options);
+  }
 }
 
 /** A wallet da submissão não existe; nada é gravado. */
