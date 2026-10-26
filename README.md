@@ -35,7 +35,7 @@ Implementado e coberto por testes (pendências no fim desta seção):
 - Publisher da outbox (opcional, `OUTBOX_PUBLISHER_ENABLED=true`): publica os eventos confirmados em
   `wager-events.fifo`, em ordem por wallet (`MessageGroupId`), com deduplicação por `eventId`,
   reserva com expiração entre publishers concorrentes e novas tentativas com backoff;
-- SQS FIFO local (ElasticMQ), com provisionamento das filas `wager-events.fifo` e
+- SQS FIFO local (MiniStack), com provisionamento das filas `wager-events.fifo` e
   `wager-transactions.fifo` e de suas DLQs;
 - Consumidor SQS de `wager-transactions.fifo` (opcional, `WAGER_TRANSACTIONS_CONSUMER_ENABLED=true`)
   com Inbox persistente gravada na mesma transação do efeito financeiro, ack só depois do commit,
@@ -63,7 +63,7 @@ Definida pelo desafio; PostgreSQL, Docker Compose, MikroORM e o SQS local já es
 | Linguagem                                     | TypeScript em modo estrito                           |
 | Framework                                     | NestJS                                               |
 | Banco de dados                                | PostgreSQL 18                                        |
-| Mensageria                                    | AWS SQS FIFO; localmente, ElasticMQ 1.7.1            |
+| Mensageria                                    | AWS SQS FIFO; localmente, MiniStack 1.5.27           |
 | Orquestração local                            | Docker Compose                                       |
 | ORM e migrations                              | MikroORM 7, com migrations versionadas e reversíveis |
 
@@ -82,7 +82,7 @@ cp .env.test.example .env.test  # ambiente dos testes com banco (valores fictíc
 bun run db:up                   # PostgreSQL de desenvolvimento
 bun run migration:up            # aplica as migrations no banco de desenvolvimento
 bun run db:test:up              # PostgreSQL de testes (descartável; os testes aplicam as migrations)
-bun run sqs:up                  # SQS local (ElasticMQ) e provisionamento das filas
+bun run sqs:up                  # SQS local (MiniStack) e provisionamento das filas
 bun run check                   # lint, typecheck, testes unitários, de integração e smoke
 bun run test:sqs                # testes de mensageria e de múltiplas instâncias (PostgreSQL + SQS)
 bun run dev            # http://localhost:3000/health/live
@@ -153,10 +153,12 @@ Política e garantias: `ARCHITECTURE.md`, seção "Referências fora de ordem".
 
 ## Mensageria (SQS)
 
-O SQS local é o [ElasticMQ](https://github.com/softwaremill/elasticmq) (`softwaremill/elasticmq-native:1.7.1`),
-serviço `sqs` do `compose.yaml`: API compatível com o SQS, sem credenciais reais, porta
-`127.0.0.1:9324`, limite de 0,5 CPU e 128 MB, healthcheck em `GET /health`. O LocalStack não foi
-usado porque, desde a versão 2026.03.0, exige token de autenticação para iniciar.
+O SQS local é o [MiniStack](https://github.com/ministackorg/ministack)
+(`ministackorg/ministack:1.5.27`, um dos emuladores citados no §4 do desafio), serviço `sqs` do
+`compose.yaml`: API compatível com o SQS, sem conta, token nem credenciais reais, porta
+`127.0.0.1:9324` (4566 dentro do container), limite de 0,5 CPU e 128 MB, healthcheck em
+`GET /_ministack/health`. O LocalStack não foi usado porque, desde a versão 2026.03.0, exige token
+de autenticação para iniciar.
 
 | Recurso                 | Configuração (definida em `src/messaging/wager-events.queues.ts`)                     |
 | ----------------------- | ------------------------------------------------------------------------------------- |
@@ -172,13 +174,13 @@ usado porque, desde a versão 2026.03.0, exige token de autenticação para inic
 | `SQS_ENDPOINT`           | URL do emulador; ausente, o SDK usa o SQS da AWS                  |
 | `SQS_WAGER_EVENTS_QUEUE` | Nome da fila principal (`.fifo`)                                  |
 | `SQS_WAGER_EVENTS_DLQ`   | Nome da DLQ (`.fifo`)                                             |
-| `SQS_PORT`               | Só no Compose: porta publicada do ElasticMQ (padrão `9324`)       |
+| `SQS_PORT`               | Só no Compose: porta publicada do MiniStack (padrão `9324`)       |
 
 ```bash
-bun run sqs:up          # sobe o ElasticMQ, aguarda o healthcheck e provisiona as filas
+bun run sqs:up          # sobe o MiniStack, aguarda o healthcheck e provisiona as filas
 bun run sqs:provision   # (re)provisiona; idempotente, confere os atributos e falha se divergirem
 bun run sqs:inspect     # mostra URL, atributos e contagem de mensagens, sem criar filas
-curl http://127.0.0.1:9324/health
+curl http://127.0.0.1:9324/_ministack/health
 ```
 
 - **Sem acesso acidental à AWS:** sem `SQS_ENDPOINT`, `sqs:provision`/`sqs:inspect` recusam executar,
@@ -192,8 +194,11 @@ curl http://127.0.0.1:9324/health
   `wager-events.fifo` deve deduplicar por `eventId`.
 - **DLQ:** apenas isola mensagens que falharam 5 vezes; o reprocessamento da DLQ é manual (não há
   ferramenta de redrive).
-- **Limitação do emulador:** o ElasticMQ aceita `MessageRetentionPeriod`, mas não o reporta; o
-  provisionamento avisa que esse atributo não pôde ser conferido. No SQS da AWS ele é conferido.
+- **Limitação do emulador:** o MiniStack não implementa `ListDeadLetterSourceQueues`; o vínculo com
+  a DLQ é conferido pela `RedrivePolicy` da fila principal. Todos os atributos provisionados,
+  inclusive `MessageRetentionPeriod`, são reportados e conferidos.
+- **Trocar de versão do MiniStack:** o projeto fixa `1.5.27`. Antes de atualizar, rode
+  `bun run test:sqs` contra a nova imagem.
 - O `MessagingModule` (`src/messaging/messaging.module.ts`) expõe a verificação de acesso às filas,
   mas não é importado pelo `AppModule`; o readiness verifica as filas por `ObservabilityModule`.
 
@@ -283,7 +288,7 @@ responderam; uma fonte fora omite os seus gauges.
 - Por que `--env-file=.env.test`: sem ele, `bun test` carrega o `.env` de desenvolvimento e o
   `.env.test` por cima, e variáveis que só existem no `.env` vazam para os testes. Variáveis do
   shell continuam tendo precedência sobre os arquivos; a proteção acima cobre esse caso.
-- `test:sqs` usa o ElasticMQ de desenvolvimento, mas cria e remove filas efêmeras com nome único
+- `test:sqs` usa o MiniStack de desenvolvimento, mas cria e remove filas efêmeras com nome único
   (`it-<id>-…fifo`); nunca toca `wager-events.fifo`. Recusa rodar se `SQS_ENDPOINT` estiver
   ausente ou fora do loopback (`test/support/test-sqs.ts`), para nunca atingir o SQS da AWS.
   Não faz parte de `bun run test`/`check`.
@@ -307,15 +312,15 @@ responderam; uma fonte fora omite os seus gauges.
 | `bun run test:unit`         | Testes unitários, sem banco e sem arquivos `.env`               |
 | `bun run test:integration`  | Testes em processo com `@nestjs/testing` no banco de teste      |
 | `bun run test:smoke`        | Sobe `src/main.ts` em processo separado, no banco de teste      |
-| `bun run test:sqs`          | Testes de mensageria no ElasticMQ, com filas efêmeras           |
+| `bun run test:sqs`          | Testes de mensageria no MiniStack, com filas efêmeras           |
 | `bun run db:up`             | Sobe o PostgreSQL e aguarda ficar saudável                      |
 | `bun run db:down`           | Remove os containers de dev, PostgreSQL e SQS (mantém o volume) |
 | `bun run db:logs`           | Acompanha os logs do PostgreSQL                                 |
 | `bun run db:test:up`        | Sobe o PostgreSQL de testes (tmpfs) e aguarda ficar saudável    |
 | `bun run db:test:down`      | Remove o PostgreSQL de testes e seus dados descartáveis         |
-| `bun run sqs:up`            | Sobe o ElasticMQ e provisiona as filas                          |
-| `bun run sqs:down`          | Remove só o container do ElasticMQ (estado em memória)          |
-| `bun run sqs:logs`          | Acompanha os logs do ElasticMQ                                  |
+| `bun run sqs:up`            | Sobe o MiniStack e provisiona as filas                          |
+| `bun run sqs:down`          | Remove só o container do MiniStack (estado em memória)          |
+| `bun run sqs:logs`          | Acompanha os logs do MiniStack                                  |
 | `bun run sqs:provision`     | Provisiona as filas de forma idempotente e confere atributos    |
 | `bun run sqs:inspect`       | Mostra URL e atributos das filas, sem criá-las                  |
 | `bun run migration:create`  | Gera uma migration a partir da diferença de schema              |

@@ -5,7 +5,7 @@ import { SQSClient } from '@aws-sdk/client-sqs';
  *
  * Credenciais não passam por aqui: o SDK da AWS as resolve pela cadeia padrão (variáveis
  * `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, perfil, papel da instância). Localmente, o
- * ElasticMQ não valida credenciais, mas o SDK exige valores; o `.env.example` usa fictícios.
+ * MiniStack não valida credenciais, mas o SDK exige valores; o `.env.example` usa fictícios.
  *
  * `SQS_ENDPOINT` é opcional: definido, aponta para o emulador local; ausente, usa o SQS da AWS.
  * Mensagens de erro citam apenas nomes de variáveis.

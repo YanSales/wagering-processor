@@ -5,7 +5,6 @@ import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
   DeleteQueueCommand,
-  ListDeadLetterSourceQueuesCommand,
   ListQueuesCommand,
   type Message,
   ReceiveMessageCommand,
@@ -97,15 +96,12 @@ describe('filas FIFO de eventos de apostas no emulador SQS', () => {
     for (const keys of [unverifiedAttributes.main, unverifiedAttributes.dlq]) {
       expect(keys.filter((key) => key !== 'MessageRetentionPeriod')).toEqual([]);
     }
+    // O vínculo com a DLQ é conferido pela RedrivePolicy da fila principal (o MiniStack não
+    // implementa ListDeadLetterSourceQueues); o redrive em si é exercitado pelo teste de DLQ abaixo.
     expect(JSON.parse(main.attributes.RedrivePolicy as string)).toEqual({
       deadLetterTargetArn: dlq.attributes.QueueArn,
       maxReceiveCount: WAGER_EVENTS_MAX_RECEIVE_COUNT,
     });
-
-    const { queueUrls } = await client.send(
-      new ListDeadLetterSourceQueuesCommand({ QueueUrl: dlq.url }),
-    );
-    expect(queueUrls).toEqual([main.url]);
   });
 
   test('reexecutar o provisionamento é idempotente', async () => {

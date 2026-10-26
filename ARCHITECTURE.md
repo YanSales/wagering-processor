@@ -14,6 +14,26 @@ aqui descreve como existente o que ainda não foi implementado e testado.
 - `src/wallets/`, `src/wagering/`, `src/health/`, `src/auth/`: borda HTTP (NestJS). Controllers só leem a entrada,
   chamam o caso de uso e traduzem o resultado para HTTP.
 
+## Estados de `WagerTransaction` (contrato §6.3)
+
+Máquina de estados de `src/domain/wager-transaction.ts`. Toda transição a partir de um estado
+terminal, ou fora das pré-condições abaixo, lança `InvalidTransactionStateError` sem alterar o
+estado (erro de programação, não caminho de negócio).
+
+| Origem                           | Transição                                   | Destino             | Pré-condição                                                                                                                                 |
+| -------------------------------- | ------------------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| (nenhuma)                        | `WagerTransaction.create`                   | `PENDING`           | Tipo submetível (nunca `OPENING`); REFUND e ROLLBACK exigem `referenceExternalTransactionId`                                                 |
+| (nenhuma)                        | `WagerTransaction.opening`                  | `PROCESSED`         | Só a transação interna `OPENING`, criada em `PENDING` e processada na própria factory                                                        |
+| `PENDING` ou `PENDING_REFERENCE` | `markProcessed(referenceTransactionId, at)` | `PROCESSED`         | Id interno da referência obrigatório se o tipo exige referência ou se o estado é `PENDING_REFERENCE`; proibido sem referência externa        |
+| `PENDING` ou `PENDING_REFERENCE` | `markPendingReference()`                    | `PENDING_REFERENCE` | Exige `referenceExternalTransactionId`; repetível enquanto a referência não aparece (§7.1)                                                   |
+| `PENDING` ou `PENDING_REFERENCE` | `reject(code)`                              | `REJECTED`          | `failureCode` no formato `^[A-Z][A-Z0-9_]*$`                                                                                                 |
+| `PENDING` ou `PENDING_REFERENCE` | `fail(code)`                                | `FAILED`            | `failureCode` no mesmo formato. O domínio permite; a persistência hoje recusa gravar `FAILED` (`assertDecision`, ver "Limite da quarentena") |
+- **Terminais:** `PROCESSED`, `REJECTED` e `FAILED` (`isTerminal()`); não há volta para `PENDING`.
+- **Não terminais:** `PENDING` (só em memória: a submissão grava o estado decidido, nunca `PENDING`)
+  e `PENDING_REFERENCE`.
+- `rehydrate` reconstrói qualquer estado persistido sem revalidar transições (§6.0).
+- Testes: `test/unit/wager-transaction.test.ts`.
+
 ## Autenticação (contrato §2)
 
 **Decisão: autenticação não implementada nesta etapa.** O contrato aceita essa opção desde que a
@@ -396,7 +416,9 @@ externa duplicada seguem iguais.
 **Eventos** (§7.1 e §11): a entrada em `PENDING_REFERENCE` grava `WagerTransactionPendingReference`
 na outbox; um novo agendamento não grava nada; a resolução grava `WagerTransactionProcessed` e
 `WalletBalanceChanged`, e o esgotamento, `WagerTransactionRejected` (`REFERENCE_NOT_FOUND`), cada um
-no mesmo commit da transição (seção "Transactional Outbox"). Ainda **não publicados**.
+no mesmo commit da transição (seção "Transactional Outbox"). Com o publisher ligado
+(`OUTBOX_PUBLISHER_ENABLED=true`), eles são publicados em `wager-events.fifo` depois do commit
+(seção "Publisher da outbox"); desligado, ficam pendentes na outbox.
 
 **Testes**: `test/integration/pending-reference.integration.test.ts`. Cobre:
 
@@ -727,7 +749,7 @@ reserva expirar; outro publisher reserva a wallet e reenvia a partir da cabeça,
   memória): uma publicação por evento em ordem de `seq`; falha que não marca, reagenda e bloqueia só
   a wallet, depois sai em ordem; dois publishers em pools distintos sem duplicata e com ordem por
   wallet; reserva de publisher caído que expira, é assumida, e cujo token antigo não marca mais.
-- `test/sqs/outbox-publisher.sqs.test.ts` (PostgreSQL e ElasticMQ reais, filas efêmeras): grupo,
+- `test/sqs/outbox-publisher.sqs.test.ts` (PostgreSQL e MiniStack reais, filas efêmeras): grupo,
   deduplicação, atributo, corpo e ordem das mensagens recebidas; reenvio descartado pelo SQS.
 
 ## Consumidor SQS e Inbox (contrato §6.5 e §10)
@@ -777,7 +799,7 @@ voo. Limitação: essas mensagens também contam um recebimento.
 único com Inbox; duplicata; replay com outro `messageId`; conflito de `messageId`; falha antes do
 commit sem Inbox nem efeito; falha transitória; rejeição de negócio como ack; erros permanentes na
 DLQ; 10 entregas paralelas em dois pools com um efeito) e
-`test/sqs/wager-transactions.consumer.sqs.test.ts` (ElasticMQ e PostgreSQL reais, filas efêmeras:
+`test/sqs/wager-transactions.consumer.sqs.test.ts` (MiniStack e PostgreSQL reais, filas efêmeras:
 ack e reenvio do produtor; mensagem mantida na fila quando o commit falha; DLQ direta com motivo;
 redrive para a DLQ depois de 5 recebimentos; ordem do grupo depois de uma falha).
 
@@ -902,7 +924,7 @@ SQS não exigido quando desligado, métricas com o banco falhando), `test/integr
 
 ## Cobertura dos testes obrigatórios (contrato §13)
 
-| §13                                            | Teste (PostgreSQL e ElasticMQ reais)                                                   |
+| §13                                            | Teste (PostgreSQL e MiniStack reais)                                                   |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------- |
 | Mesma aposta 50 vezes em paralelo → um débito  | `bet-processing`: 50 submissões idênticas em **3 processos** Bun (`bet-worker.ts`)     |
 | Saldo disputado (cenário do §8)                | `bet-processing` (2 processos), HTTP; e via SQS em `instances.sqs` (3 instâncias)      |
@@ -923,11 +945,14 @@ servidor HTTP não sobe nesses processos (a API é coberta pelos testes HTTP em 
 
 ## Decisões, trade-offs e limitações (contrato §14)
 
-- **SQS local com ElasticMQ, não LocalStack/MiniStack**: o §4 cita LocalStack ou MiniStack. O
-  LocalStack passou a exigir token de autenticação para iniciar (versão 2026.03.0); o ElasticMQ
-  oferece API compatível com o SQS, sem credenciais. O `README.md` não registra avaliação do
-  MiniStack. Limitação: o
-  ElasticMQ não reporta `MessageRetentionPeriod` (ver `README.md`).
+- **SQS local com MiniStack** (`ministackorg/ministack:1.5.27`), um dos emuladores que o §4 aceita.
+  O LocalStack foi descartado porque passou a exigir token de autenticação para iniciar (versão
+  2026.03.0). O projeto usava o ElasticMQ; a troca foi validada rodando a suíte `test:sqs` inteira
+  contra o MiniStack (FIFO por `MessageGroupId`, deduplicação por `MessageDeduplicationId`,
+  visibilidade, retries limitados e redrive para a DLQ, três processos, queda entre commit e ack).
+  Limitação do emulador: não implementa `ListDeadLetterSourceQueues`, que só um teste usava; o
+  vínculo com a DLQ é conferido pela `RedrivePolicy`. O MiniStack não é o SQS da AWS: a semântica
+  validada é a que os testes exercitam.
 - **SQL cru para o ledger**: contorna a limitação do MikroORM descrita no §4 acima, ao custo de
   depender do escape de valores do próprio ORM, e não de parâmetros enviados ao PostgreSQL.
 - **Autenticação não implementada**: ver a seção acima; a API não está protegida.

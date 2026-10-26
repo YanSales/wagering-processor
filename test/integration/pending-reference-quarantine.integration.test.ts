@@ -31,6 +31,9 @@ assertTestDatabaseEnv();
 const { Processed, PendingReference } = WagerTransactionStatus;
 const brl = (cents: bigint) => Money.fromCents(cents, 'BRL');
 const policy = ReferenceRetryPolicy.from(DEFAULT_REFERENCE_RETRY);
+// O cenário de starvation precisa de mais pendências (58) que o lote (50): o preparo e a rodada de 50
+// tentativas reais, cada uma desfeita e adiada em transação própria, levam ~4 s sem carga.
+const STARVATION_TIMEOUT_MS = 20_000;
 
 let orm: MikroORM;
 let otherOrm: MikroORM;
@@ -81,11 +84,11 @@ const refundOf = (w: WalletRef, bet: SubmitWagerTransactionCommand) =>
   });
 
 /** REFUND pendente numa wallet nova; a BET referenciada só é submetida quando o teste quiser. */
-async function pendingRefund() {
+async function pendingRefund(submitter: SubmitWagerTransaction = submit) {
   const wallet = await openWallet();
   const bet = betOn(wallet);
   const refund = refundOf(wallet, bet);
-  expect((await submit.execute(refund)).status).toBe(PendingReference);
+  expect((await submitter.execute(refund)).status).toBe(PendingReference);
   const { id } = await row(refund.idempotencyKey);
   return { wallet, bet, refund, id };
 }
@@ -273,46 +276,58 @@ describe('quarentena de falhas operacionais do worker', () => {
     expect(Number(stored.next_ms) - clock.ms).toBe(4_000);
   });
 
-  test('starvation: 55 transações com defeito não impedem as saudáveis de avançar', async () => {
-    const walletIds: string[] = [];
-    const faults = new Map<string, Fault>();
-    for (let i = 0; i < 55; i++) {
-      const { wallet, id } = await pendingRefund();
-      walletIds.push(wallet.walletId);
-      faults.set(id, 'defect');
-    }
-    const healthy: SubmitWagerTransactionCommand[] = [];
-    for (let i = 0; i < 3; i++) {
-      const { wallet, bet, refund } = await pendingRefund();
-      await submit.execute(bet);
-      walletIds.push(wallet.walletId);
-      healthy.push(refund);
-    }
-    const pending = repository(walletIds, faults);
-    const now = () => new Date(Date.now() + 3_000);
+  test(
+    'starvation: 55 transações com defeito não impedem as saudáveis de avançar',
+    async () => {
+      // Relógios fixos: as 55 com defeito são submetidas em t0 e as saudáveis em t0 + 1 ms, então são
+      // sempre as mais antigas (ordem por próxima tentativa), qualquer que seja a duração do preparo.
+      // O worker roda as duas rodadas no mesmo instante, depois da primeira tentativa (t0 + 2 s).
+      const t0 = Date.now();
+      const submitAt = (ms: number) =>
+        new SubmitWagerTransaction(new MikroOrmWagerTransactionRepository(orm), () => new Date(ms));
+      const walletIds: string[] = [];
+      const faults = new Map<string, Fault>();
+      const defective = await Promise.all(
+        Array.from({ length: 55 }, () => pendingRefund(submitAt(t0))),
+      );
+      for (const { wallet, id } of defective) {
+        walletIds.push(wallet.walletId);
+        faults.set(id, 'defect');
+      }
+      const healthy: SubmitWagerTransactionCommand[] = [];
+      for (let i = 0; i < 3; i++) {
+        const { wallet, bet, refund } = await pendingRefund(submitAt(t0 + 1));
+        await submit.execute(bet);
+        walletIds.push(wallet.walletId);
+        healthy.push(refund);
+      }
+      const pending = repository(walletIds, faults);
+      const { now } = clockAt(t0 + 3_000);
 
-    // 1ª rodada: o lote (50) é todo de transações com defeito, as mais antigas; vão para a quarentena.
-    const first = await worker(pending, now).runOnce();
-    expect(first).toMatchObject({ due: 50, failures: 50, deferred: 50, processed: 0 });
+      // 1ª rodada: o lote (50) é todo de transações com defeito, as mais antigas; vão para a quarentena.
+      const first = await worker(pending, now).runOnce();
+      expect(first).toMatchObject({ due: 50, failures: 50, deferred: 50, processed: 0 });
 
-    // 2ª rodada, mesmo instante: as adiadas saem do caminho, e as saudáveis são processadas.
-    const second = await worker(pending, now).runOnce();
-    expect(second).toMatchObject({ due: 8, failures: 5, deferred: 5, processed: 3 });
-    for (const refund of healthy) {
-      expect(await row(refund.idempotencyKey)).toMatchObject({
-        status: Processed,
-        processing_failures: 0,
-      });
-    }
-    // Todas as 55 com defeito: em quarentena, nenhuma tentativa de resolução consumida.
-    const [stuck] = await sql<{ count: number }>(
-      `select count(*)::int as count from wager_transactions
+      // 2ª rodada, mesmo instante: as adiadas saem do caminho, e as saudáveis são processadas.
+      const second = await worker(pending, now).runOnce();
+      expect(second).toMatchObject({ due: 8, failures: 5, deferred: 5, processed: 3 });
+      for (const refund of healthy) {
+        expect(await row(refund.idempotencyKey)).toMatchObject({
+          status: Processed,
+          processing_failures: 0,
+        });
+      }
+      // Todas as 55 com defeito: em quarentena, nenhuma tentativa de resolução consumida.
+      const [stuck] = await sql<{ count: number }>(
+        `select count(*)::int as count from wager_transactions
         where id = any(string_to_array(?, ',')::uuid[])
           and status = 'PENDING_REFERENCE' and reference_attempts = 0 and processing_failures = 1`,
-      [[...faults.keys()].join(',')],
-    );
-    expect(stuck?.count).toBe(55);
-  });
+        [[...faults.keys()].join(',')],
+      );
+      expect(stuck?.count).toBe(55);
+    },
+    STARVATION_TIMEOUT_MS,
+  );
 
   test('falha transitória: sem quarentena, sem consumir tentativa, linha intacta', async () => {
     const { wallet, refund, id } = await pendingRefund();

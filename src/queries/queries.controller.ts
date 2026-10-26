@@ -18,6 +18,7 @@ import {
   type TransactionView,
 } from '../application/queries';
 import type { MoneyProps } from '../domain/money';
+import { metrics } from '../observability/metrics';
 import { RequestErrorCodes, requestError } from '../wagering/wagering-transactions.controller';
 import { toWalletResponse, type WalletResponse } from '../wallets/open-wallet.request';
 
@@ -115,7 +116,8 @@ export class WalletQueriesController {
 
   /**
    * `POST /wallets/:walletId/reconciliation`: compara o saldo armazenado com o reconstruído pelo
-   * ledger. Não corrige nada; divergência sai em `consistent: false` e num log de alerta.
+   * ledger. Não corrige nada; divergência sai em `consistent: false`, num log de alerta e em
+   * `wagering_reconciliation_divergences_total` (sem rótulos: o `walletId` fica só no log).
    */
   @Post(':walletId/reconciliation')
   @HttpCode(HttpStatus.OK)
@@ -123,6 +125,7 @@ export class WalletQueriesController {
     const result = await this.reconcile.execute(uuid('walletId', walletId));
     if (result === null) throw walletNotFound(walletId);
     if (!result.consistent) {
+      metrics.reconciliationDivergences.inc();
       this.#logger.warn(
         JSON.stringify({
           event: 'wallet_reconciliation_divergence',

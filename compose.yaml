@@ -28,20 +28,28 @@ services:
           memory: 512M
     restart: unless-stopped
 
-  # Emulador local compatível com a API do SQS (filas FIFO, deduplicação, DLQ via RedrivePolicy).
-  # Sem credenciais reais. Estado apenas em memória: filas e mensagens somem ao recriar o container;
-  # recrie as filas com `bun run sqs:provision` (ou `bun run sqs:up`).
+  # MiniStack (emulador AWS citado no §4 do desafio), usado só pelo SQS: filas FIFO, deduplicação,
+  # visibilidade e DLQ via RedrivePolicy. Sem conta nem token. Estado apenas em memória (sem
+  # PERSIST_STATE): filas e mensagens somem ao recriar o container; recrie as filas com
+  # `bun run sqs:provision` (ou `bun run sqs:up`).
   sqs:
-    image: softwaremill/elasticmq-native:1.7.1
+    image: ministackorg/ministack:1.5.27
     ports:
-      # Exposto apenas no loopback do host.
-      - "127.0.0.1:${SQS_PORT:-9324}:9324"
-    # A imagem declara VOLUME /data (usado só com persistência habilitada). O tmpfs no mesmo caminho
-    # evita a criação de um volume anônimo.
+      # Exposto apenas no loopback do host. O MiniStack monta a URL da fila a partir do Host da
+      # requisição, então a porta do host pode diferir da 4566 do container.
+      - "127.0.0.1:${SQS_PORT:-9324}:4566"
+    # A imagem declara VOLUMEs para scripts de inicialização, que não usamos. O tmpfs nos mesmos
+    # caminhos evita a criação de volumes anônimos.
     tmpfs:
-      - /data
+      - /docker-entrypoint-initaws.d
+      - /etc/localstack/init
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9324/health || exit 1"]
+      # A imagem não tem wget nem curl; usa o Python dela.
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request as r; r.urlopen(''http://127.0.0.1:4566/_ministack/health'')" || exit 1',
+        ]
       interval: 5s
       timeout: 3s
       retries: 10

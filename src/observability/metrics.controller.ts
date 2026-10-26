@@ -60,6 +60,7 @@ export class MetricsController {
       ...metrics.retries.render(),
       ...metrics.deadLettered.render(),
       ...metrics.lockConflicts.render(),
+      ...metrics.reconciliationDivergences.render(),
       ...metrics.processingDuration.render(),
     );
     return `${lines.join('\n')}\n`;

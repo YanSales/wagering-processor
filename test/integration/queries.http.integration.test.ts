@@ -5,6 +5,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../src/app.module';
+import { metrics } from '../../src/observability/metrics';
 import { assertTestDatabaseEnv, DATABASE_BOOTSTRAP_TIMEOUT_MS } from '../support/test-database';
 
 // O AppModule conecta ao PostgreSQL e os endpoints gravam: só roda contra o banco de teste.
@@ -186,6 +187,7 @@ describe('POST /wallets/:walletId/reconciliation', () => {
   test('consistente: saldo armazenado igual ao reconstruído pelo ledger', async () => {
     const wallet = await openWallet('100.00');
     await bet(wallet, '12.34');
+    const divergencesBefore = metrics.reconciliationDivergences.get();
 
     const response = await fetch(`${baseUrl}/wallets/${wallet.id}/reconciliation`, {
       method: 'POST',
@@ -200,6 +202,8 @@ describe('POST /wallets/:walletId/reconciliation', () => {
       consistent: true,
       checkedEntries: 2,
     });
+    // Sem divergência, a métrica não muda.
+    expect(metrics.reconciliationDivergences.get()).toBe(divergencesBefore);
   });
 
   test('divergência é sinalizada, sem corrigir a wallet; inexistente: 404', async () => {
@@ -209,6 +213,7 @@ describe('POST /wallets/:walletId/reconciliation', () => {
     await orm.em
       .getConnection()
       .execute('update wallets set balance_cents = balance_cents + 150 where id = ?', [wallet.id]);
+    const divergencesBefore = metrics.reconciliationDivergences.get();
     try {
       const response = await fetch(`${baseUrl}/wallets/${wallet.id}/reconciliation`, {
         method: 'POST',
@@ -224,6 +229,13 @@ describe('POST /wallets/:walletId/reconciliation', () => {
       expect(await json(await get(`/wallets/${wallet.id}`))).toMatchObject({
         balance: { amount: '51.50', currency: 'BRL' },
       });
+      // Contabilizada uma vez, sem rótulos, e exposta em /metrics.
+      expect(metrics.reconciliationDivergences.get()).toBe(divergencesBefore + 1);
+      const exposition = await (await get('/metrics')).text();
+      expect(exposition).toContain('# TYPE wagering_reconciliation_divergences_total counter');
+      expect(exposition).toContain(
+        `\nwagering_reconciliation_divergences_total ${divergencesBefore + 1}\n`,
+      );
     } finally {
       await orm.em
         .getConnection()
@@ -235,5 +247,6 @@ describe('POST /wallets/:walletId/reconciliation', () => {
       method: 'POST',
     });
     expect(missing.status).toBe(404);
+    expect(metrics.reconciliationDivergences.get()).toBe(divergencesBefore + 1);
   });
 });

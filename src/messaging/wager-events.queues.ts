@@ -45,7 +45,8 @@ export interface WagerEventsQueuesDescription {
 export interface ProvisionedWagerEventsQueues extends WagerEventsQueuesDescription {
   /**
    * Atributos definidos que o provedor aceitou, mas não reporta em `GetQueueAttributes` e que,
-   * portanto, não puderam ser conferidos (ex.: o ElasticMQ não reporta `MessageRetentionPeriod`).
+   * portanto, não puderam ser conferidos. O MiniStack reporta todos; outros emuladores podem omitir
+   * `MessageRetentionPeriod`.
    */
   unverifiedAttributes: { main: string[]; dlq: string[] };
 }

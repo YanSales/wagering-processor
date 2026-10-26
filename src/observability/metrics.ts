@@ -134,6 +134,10 @@ export const metrics = {
     'wagering_lock_conflicts_total',
     'Falhas por conflito de lock no PostgreSQL (deadlock, serializacao, lock indisponivel).',
   ),
+  reconciliationDivergences: new Counter(
+    'wagering_reconciliation_divergences_total',
+    'Reconciliacoes com saldo armazenado diferente do reconstruido pelo ledger (nada e corrigido).',
+  ),
   processingDuration: new Histogram<{ channel: Channel }>(
     'wagering_processing_duration_seconds',
     'Latencia do processamento de uma submissao, da entrada ate a resposta ou decisao.',
