@@ -9,7 +9,7 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
 
 ## Status
 
-**Em construção.** Neste momento o repositório contém:
+Implementado e coberto por testes (pendências no fim desta seção):
 
 - a fundação do projeto, o bootstrap do NestJS e `GET /health/live`;
 - PostgreSQL via Docker Compose, MikroORM e o schema financeiro (wallets, transações e ledger
@@ -35,14 +35,12 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
 - Publisher da outbox (opcional, `OUTBOX_PUBLISHER_ENABLED=true`): publica os eventos confirmados em
   `wager-events.fifo`, em ordem por wallet (`MessageGroupId`), com deduplicação por `eventId`,
   reserva com expiração entre publishers concorrentes e novas tentativas com backoff;
-- SQS FIFO local (ElasticMQ), com provisionamento da fila `wager-events.fifo` e de sua DLQ.
-
+- SQS FIFO local (ElasticMQ), com provisionamento das filas `wager-events.fifo` e
+  `wager-transactions.fifo` e de suas DLQs;
 - Consumidor SQS de `wager-transactions.fifo` (opcional, `WAGER_TRANSACTIONS_CONSUMER_ENABLED=true`)
   com Inbox persistente gravada na mesma transação do efeito financeiro, ack só depois do commit,
   retries com backoff e DLQ;
-
-- `GET /health/ready` e `GET /metrics` (formato Prometheus) com as métricas do §12.
-
+- `GET /health/ready` e `GET /metrics` (formato Prometheus) com as métricas do §12;
 - ROLLBACK de BET, WIN ou REFUND, inclusive antes da referência (`PENDING_REFERENCE`), com
   `REVERSAL_WOULD_OVERDRAW` para débito sem saldo (§7, regra 9);
 - uma reversão por operação original, no total (um REFUND **ou** um ROLLBACK, nunca os dois):
@@ -52,8 +50,8 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
 
 Ainda **não há** WIN e LOSS com referência (recusadas: o contrato não define as regras, ver
 `ARCHITECTURE.md`, "Dúvidas do contrato") nem autenticação (só o ponto de extensão).
-Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md). Esta seção é atualizada a cada
-etapa concluída; nada é descrito como pronto antes de estar implementado e verificado.
+Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md); nada é descrito como pronto
+antes de estar implementado e verificado.
 
 ## Stack alvo
 
@@ -174,6 +172,7 @@ usado porque, desde a versão 2026.03.0, exige token de autenticação para inic
 | `SQS_ENDPOINT`           | URL do emulador; ausente, o SDK usa o SQS da AWS                  |
 | `SQS_WAGER_EVENTS_QUEUE` | Nome da fila principal (`.fifo`)                                  |
 | `SQS_WAGER_EVENTS_DLQ`   | Nome da DLQ (`.fifo`)                                             |
+| `SQS_PORT`               | Só no Compose: porta publicada do ElasticMQ (padrão `9324`)       |
 
 ```bash
 bun run sqs:up          # sobe o ElasticMQ, aguarda o healthcheck e provisiona as filas
@@ -188,10 +187,11 @@ curl http://127.0.0.1:9324/health
 - **Estado em memória:** recriar o container (`sqs:down`/`sqs:up`, `db:down`) apaga filas e
   mensagens; `sqs:up` reprovisiona. Não há volume.
 - **Garantias:** FIFO ordena por `MessageGroupId` e deduplica por `MessageDeduplicationId` numa
-  janela de 5 minutos. Isso **não** é entrega exactly-once: reentregas acontecem e o consumidor
-  precisará de idempotência de negócio (Inbox), a ser implementada.
-- **DLQ:** apenas isola mensagens que falharam 5 vezes; reprocessamento e reconciliação ainda não
-  existem.
+  janela de 5 minutos. Isso **não** é entrega exactly-once: reentregas acontecem. O consumidor de
+  `wager-transactions.fifo` as absorve com Inbox e idempotência de negócio; quem consumir
+  `wager-events.fifo` deve deduplicar por `eventId`.
+- **DLQ:** apenas isola mensagens que falharam 5 vezes; o reprocessamento da DLQ é manual (não há
+  ferramenta de redrive).
 - **Limitação do emulador:** o ElasticMQ aceita `MessageRetentionPeriod`, mas não o reporta; o
   provisionamento avisa que esse atributo não pôde ser conferido. No SQS da AWS ele é conferido.
 - O `MessagingModule` (`src/messaging/messaging.module.ts`) expõe a verificação de acesso às filas,

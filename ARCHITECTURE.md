@@ -105,13 +105,10 @@ justificados aqui.
 - Todo lançamento do ledger usa o mesmo caminho de gravação, dentro da transação da operação.
 - Nenhuma chamada externa (SQS, HTTP) dentro de uma transação de banco. Eventos só depois do
   commit, por Outbox transacional (exigências do contrato, §5.4 e §11): a gravação na outbox já
-  existe (seção "Transactional Outbox"); a publicação ainda não.
-
-### Pendente
-
-- Consultas do §9 (`GET /wallets/:id`, ledger, transações) e leitura do ledger pelo ORM, que pode
-  esbarrar na mesma limitação da FK composta. Hoje a wallet só é reidratada dentro da transação de
-  processamento, sob lock.
+  existe (seção "Transactional Outbox"), e a publicação é feita pelo publisher (seção "Publisher da
+  outbox").
+- As consultas do §9 leem wallet, ledger e transações com SQL cru (seção "Consultas e
+  reconciliação"), sem passar a FK composta do ledger pelo ORM.
 
 ## Concorrência (contrato §8)
 
@@ -192,9 +189,9 @@ contra o mesmo PostgreSQL, que é quem garante a serialização.
 
 ### Pendente
 
-- Aplicar a mesma estratégia ao ROLLBACK e ao WIN com referência quando forem implementados,
-  reutilizando `applyToLockedWallet` e `resolvePendingReference` (o REFUND e o worker de
-  `PENDING_REFERENCE` já os usam, seção "Referências fora de ordem").
+- Aplicar a mesma estratégia ao WIN com referência, se o contrato for esclarecido, reutilizando
+  `applyToLockedWallet` e `resolvePendingReference` (REFUND, ROLLBACK e o worker de
+  `PENDING_REFERENCE` já os usam, seções "Referências fora de ordem" e "ROLLBACK").
 - Timeout de espera pelo lock (`lock_timeout`) não está configurado: uma transação presa seguraria
   as operações daquela wallet até o timeout de conexão ou o fim da transação.
 
@@ -947,7 +944,7 @@ servidor HTTP não sobe nesses processos (a API é coberta pelos testes HTTP em 
   zero (e de REFUND de valor zero); se BET e LOSS admitem referência e o que um LOSS referenciaria;
   se a BET referenciada por um WIN precisa estar `PROCESSED`; e se há limite de WINs por rodada ou
   por BET (o contrato não define, e nada foi limitado). LOSS de valor zero segue a regra registrada
-  no projeto (aceito). A taxonomia de `failureCode` cobre BET, WIN, LOSS e REFUND (seção acima).
+  no projeto (aceito). A taxonomia de `failureCode` cobre BET, WIN, LOSS, REFUND e ROLLBACK (seções acima).
 - **Worker de referências pendentes no banco, não no SQS**: a fila FIFO não permite atraso por
   mensagem, e o estado (tentativas, próxima data) precisa ser persistente e consultável. A busca é
   periódica e indexada, e cada rodada é limitada. Trade-off: há latência de até um intervalo de
