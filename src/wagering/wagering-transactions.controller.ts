@@ -22,6 +22,7 @@ import {
 import { AmountOutOfStorageRangeError } from '../application/wallet-repository';
 import { InvalidMoneyError } from '../domain/money';
 import { WagerTransactionStatus } from '../domain/wager-transaction';
+import { metrics } from '../observability/metrics';
 import {
   InvalidSubmissionRequestError,
   parseSubmissionRequest,
@@ -80,9 +81,14 @@ export class WageringTransactionsController {
 
     let result: SubmissionResult;
     try {
-      result = await this.submitTransaction.execute(command);
+      result = await metrics.processingDuration.time({ channel: 'http' }, () =>
+        this.submitTransaction.execute(command),
+      );
     } catch (error) {
       throw toRequestError(error);
+    }
+    if (result.idempotentReplay) {
+      metrics.duplicates.inc({ channel: 'http', type: 'idempotency_replay' });
     }
     response.status(statusFor(result.status));
     return toSubmissionResponse(result);

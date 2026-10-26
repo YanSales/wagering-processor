@@ -4,6 +4,7 @@ import type {
   ReprocessSummary,
 } from '../application/reprocess-pending-references';
 import { TransientPersistenceError } from '../application/wager-transaction-repository';
+import { metrics } from '../observability/metrics';
 
 /** Só o necessário de um logger, para testes. */
 export type WorkerLogger = Pick<Logger, 'log' | 'warn' | 'error'>;
@@ -73,6 +74,9 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnApplica
   #report(summary: ReprocessSummary): void {
     // Sem valores monetários nem payloads: só contagens (§12).
     if (summary.due === 0) return;
+    // Novas tentativas agendadas: referência ainda ausente e falhas (transitórias ou em quarentena).
+    const retries = summary.rescheduled + summary.transientFailures + summary.deferred;
+    if (retries > 0) metrics.retries.inc({ component: 'pending_reference' }, retries);
     const message = JSON.stringify({ event: 'pending_reference_round', ...summary });
     if (summary.failures > 0 || summary.transientFailures > 0 || summary.deferFailures > 0) {
       this.logger.warn(message);

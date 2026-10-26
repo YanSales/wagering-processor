@@ -1,5 +1,6 @@
 import { Logger, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common';
 import type { PublishOutbox, PublishOutboxSummary } from '../application/outbox/publish-outbox';
+import { metrics } from '../observability/metrics';
 
 /** Só o necessário de um logger, para testes. */
 export type PublisherLogger = Pick<Logger, 'log' | 'warn' | 'error'>;
@@ -72,6 +73,7 @@ export class OutboxPublisherWorker implements OnApplicationBootstrap, OnApplicat
   #report(summary: PublishOutboxSummary): void {
     // Só contagens (§12): nada de payloads nem valores.
     if (summary.claimed === 0) return;
+    if (summary.failed > 0) metrics.retries.inc({ component: 'outbox_publisher' }, summary.failed);
     const message = JSON.stringify({ event: 'outbox_publish_round', ...summary });
     if (summary.failed > 0 || summary.leaseLost > 0) this.logger.warn(message);
     else this.logger.log(message);
