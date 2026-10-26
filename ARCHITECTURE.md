@@ -558,11 +558,11 @@ unidos por vírgula e é aceito como uma única chave.
 
 ## Transactional Outbox (contrato §6.5 e §11)
 
-**O que existe**: a gravação. Cada decisão financeira grava seus eventos de integração em
-`outbox_messages` **na mesma transação SQL** que grava a transação, o saldo, a versão e o
-lançamento. Ou tudo é confirmado no mesmo commit, ou nada. **O que ainda não existe**: o publisher
-(leitura dos pendentes, lease, envio para `wager-events.fifo`, retry) e qualquer consumidor dos
-eventos. Nenhum evento é publicado hoje.
+**O que existe**: a gravação e o publisher. Cada decisão financeira grava seus eventos de
+integração em `outbox_messages` **na mesma transação SQL** que grava a transação, o saldo, a versão
+e o lançamento. Ou tudo é confirmado no mesmo commit, ou nada. O publisher (seção "Publisher da
+outbox") envia os eventos confirmados para `wager-events.fifo`. **O que ainda não existe**: um
+consumidor dos eventos.
 
 **Por que na mesma transação**: publicar antes do commit poderia anunciar uma alteração desfeita
 depois; publicar depois do commit, sem registro, perderia o evento se o processo morresse entre os
@@ -622,8 +622,8 @@ correlação original da submissão, que nunca foi gravada. Transações que já
 `WagerTransactionPendingReference`; se forem resolvidas ou esgotadas depois, os novos eventos usam a
 correlação persistida pela migration.
 
-**Entrega futura: at-least-once**. O publisher só poderá marcar o evento como publicado depois de o
-SQS aceitá-lo; se cair entre o envio e a marcação, o evento será reenviado. Por isso o evento é
+**Entrega at-least-once**. O publisher só marca o evento como publicado depois de o SQS aceitá-lo;
+se cair entre o envio e a marcação, o evento é reenviado. Por isso o evento é
 gravado uma vez, com `eventId` fixo, e toda republicação envia o mesmo envelope: o consumidor
 reconhece a duplicata pelo `eventId`. FIFO com deduplicação não torna isso exactly-once (a janela
 de deduplicação do SQS é limitada).
@@ -659,9 +659,9 @@ A garantia por wallet depende destas premissas, que nem o banco nem o código im
   restauração parcial podem invalidar a monotonicidade esperada.
 
 **Entre wallets**, `seq` não indica ordem de commit, e não precisa. A ordem de `seq` também não
-garante, por si só, a ordem de publicação no SQS FIFO; isso dependerá do publisher, que ainda não
-existe: enviar os eventos de cada wallet em ordem de `seq`, só liberar um evento de uma wallet
-quando os anteriores dela já tiverem sido publicados e publicar com `MessageGroupId = walletId`.
+garante, por si só, a ordem de publicação no SQS FIFO; isso depende do publisher, que envia os
+eventos de cada wallet em ordem de `seq`, só libera um evento de uma wallet quando os anteriores
+dela já foram publicados e publica com `MessageGroupId = walletId` (seção seguinte).
 
 **Testes** (`test/integration/outbox.integration.test.ts`, PostgreSQL real): envelope persistido e
 coerente com as colunas; eventos por operação (BET, WIN, LOSS, REFUND, rejeição, abertura positiva
@@ -672,6 +672,65 @@ worker e abertura); falha no ledger ou no estado não deixa evento órfão; cons
 entrega duplicada concorrente com um efeito e dois eventos; `seq` coerente com a ordem de commit
 numa wallet; wallets independentes; sequência de `seq` com `CACHE 1`; migration revertida e
 reaplicada preenchendo a correlação.
+
+## Publisher da outbox (contrato §11)
+
+`PublishOutbox` (`src/application/outbox/publish-outbox.ts`) executa uma rodada; o
+`OutboxPublisherWorker` (`src/messaging/`) agenda as rodadas como o worker de `PENDING_REFERENCE`
+(uma por vez, sem estado em memória). A reserva e a marcação estão em `MikroOrmOutboxRepository`
+(`src/database/repositories/outbox.repository.ts`), uma instrução SQL por operação, com o relógio
+do banco. O envio está em `SqsEventPublisher` (`src/messaging/sqs-event-publisher.ts`).
+
+**Rodada**:
+
+1. **Reserva por wallet**: só a "cabeça" de uma wallet (o evento não publicado de menor `seq`) pode
+   ser reservada, se vencida (`next_attempt_at <= now()`) e sem reserva válida. A cabeça é travada
+   com `FOR UPDATE SKIP LOCKED` e, na mesma instrução, ela e os eventos seguintes da wallet (até
+   `maxPerGroup`) recebem `claim_token` e `claimed_until = now() + lease`. Dois publishers nunca
+   reservam a mesma wallet; quem chega depois do commit vê a cabeça reservada.
+2. **Envio em ordem**: os eventos de cada wallet saem um de cada vez, em ordem de `seq`, com
+   `MessageGroupId = walletId`, `MessageDeduplicationId = eventId`, o envelope gravado como corpo e
+   `eventType` como atributo. Cada envio tem timeout (`sendTimeoutMs`, até metade da reserva).
+3. **Marcação só depois do aceite**: `published_at` é gravado depois de o SQS aceitar o envio, e só
+   se a reserva ainda for do mesmo token. Uma reserva perdida (expirada e assumida por outro
+   publisher) interrompe a wallet na rodada, sem sobrescrever o trabalho do outro.
+4. **Falha de envio**: o evento não é marcado; `attempts + 1`, `last_error_code` (nome do erro) e
+   `next_attempt_at = now() + backoff` (1 s dobrando até 60 s). Os eventos seguintes da wallet não
+   são enviados: a wallet espera o evento que falhou. As outras wallets seguem.
+5. **Fim da rodada**: as reservas restantes do token são liberadas. Nenhum envio começa depois de
+   metade da reserva; o restante fica de margem para o envio em curso e a marcação.
+
+**Recuperação**: um publisher que cai com eventos reservados (antes ou depois de enviar) deixa a
+reserva expirar; outro publisher reserva a wallet e reenvia a partir da cabeça, com os mesmos
+`eventId`s. É o cenário do §11 (commit, processo morre antes de publicar, outra instância publica).
+
+**Decisões**:
+
+- **Sem limite de tentativas nem DLQ na publicação**: um evento confirmado nunca é descartado
+  (§11, "sem perder"), e descartá-lo quebraria a ordem da wallet. Uma falha permanente (ex.: fila
+  inexistente) para a wallet afetada com backoff até 60 s e aparece nos logs
+  (`outbox_publish_failed`, com `eventId`, `walletId` e o nome do erro); as outras wallets seguem.
+- **Desligado por padrão** (`OUTBOX_PUBLISHER_ENABLED=false`): só quando ligado a configuração do
+  SQS é lida. Assim a API e os testes que sobem o `AppModule` não dependem do broker. Em produção e
+  na demonstração, ligar com a fila provisionada (`bun run sqs:up`).
+- **Destino `wager-events.fifo`**: o contrato não define a fila dos eventos de saída. As filas do
+  §10 (`wager-transactions.fifo` e a DLQ) são de entrada.
+- **Duplicatas possíveis, todas com o mesmo `eventId`**: reenvio após a queda de um publisher, ou um
+  envio que excede a reserva. Dentro de 5 min, a deduplicação do SQS as descarta; depois, o
+  consumidor deduplica pelo `eventId`. Não é exactly-once.
+- **Envio individual** (`SendMessage`), não em lote: simplifica a parada da wallet na primeira
+  falha. Vazão: uma wallet por vez em cada publisher; várias instâncias dividem as wallets.
+
+**Testes**:
+
+- `test/unit/publish-outbox.test.ts`: ordem, marcação depois do envio, parada da wallet na falha,
+  backoff, reserva perdida, limite de tempo da reserva e liberação mesmo com erro.
+- `test/integration/outbox-publisher.integration.test.ts` (PostgreSQL real, broker registrado em
+  memória): uma publicação por evento em ordem de `seq`; falha que não marca, reagenda e bloqueia só
+  a wallet, depois sai em ordem; dois publishers em pools distintos sem duplicata e com ordem por
+  wallet; reserva de publisher caído que expira, é assumida, e cujo token antigo não marca mais.
+- `test/sqs/outbox-publisher.sqs.test.ts` (PostgreSQL e ElasticMQ reais, filas efêmeras): grupo,
+  deduplicação, atributo, corpo e ordem das mensagens recebidas; reenvio descartado pelo SQS.
 
 ## Decisões, trade-offs e limitações (contrato §14)
 
@@ -704,10 +763,8 @@ reaplicada preenchendo a correlação.
 
 ## Ainda não implementado
 
-WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), publicação da Outbox (publisher, lease,
-retry e `wager-events.fifo`), Inbox, consumo SQS, retry e DLQ da entrada (§6.5, §10 e §11),
-consultas e reconciliação pela API (`GET /wallets/:id`, ledger, transações), autenticação real
-(§2), observabilidade (§12: métricas, inclusive outbox lag) e `GET /health/ready`. Política terminal
-(`FAILED`) para falhas operacionais persistentes do worker: decisão pendente (hoje, quarentena sem
-fim). Os eventos já são gravados na outbox, mas, enquanto não forem publicados, o contrato não está
-completo.
+WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), Inbox, consumo SQS de
+`wager-transactions.fifo`, retry e DLQ da entrada (§6.5 e §10), consultas e reconciliação pela API
+(`GET /wallets/:id`, ledger, transações), autenticação real (§2), observabilidade (§12: métricas,
+inclusive outbox lag) e `GET /health/ready`. Política terminal (`FAILED`) para falhas operacionais
+persistentes do worker: decisão pendente (hoje, quarentena sem fim).

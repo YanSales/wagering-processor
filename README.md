@@ -32,11 +32,14 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
   (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference`,
   `WalletBalanceChanged`) são gravados em `outbox_messages` no mesmo commit da alteração
   financeira, com a correlação da operação; as transações guardam essa correlação;
+- Publisher da outbox (opcional, `OUTBOX_PUBLISHER_ENABLED=true`): publica os eventos confirmados em
+  `wager-events.fifo`, em ordem por wallet (`MessageGroupId`), com deduplicação por `eventId`,
+  reserva com expiração entre publishers concorrentes e novas tentativas com backoff;
 - SQS FIFO local (ElasticMQ), com provisionamento da fila `wager-events.fifo` e de sua DLQ.
 
-Ainda **não há** processamento de WIN e LOSS com referência e ROLLBACK (a API responde 501),
-publicação dos eventos da outbox (nenhum evento sai do banco ainda), Inbox, consumo de mensagens,
-consultas da API, autenticação (só o ponto de extensão) nem `GET /health/ready`.
+Ainda **não há** processamento de WIN e LOSS com referência e ROLLBACK (a API responde 501), Inbox,
+consumo de mensagens de entrada, consultas da API, autenticação (só o ponto de extensão) nem
+`GET /health/ready`.
 Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md). Esta seção é atualizada a cada
 etapa concluída; nada é descrito como pronto antes de estar implementado e verificado.
 
@@ -173,7 +176,28 @@ curl http://127.0.0.1:9324/health
 - **Limitação do emulador:** o ElasticMQ aceita `MessageRetentionPeriod`, mas não o reporta; o
   provisionamento avisa que esse atributo não pôde ser conferido. No SQS da AWS ele é conferido.
 - O `MessagingModule` (`src/messaging/messaging.module.ts`) expõe a verificação de acesso às filas,
-  mas ainda não é importado pelo `AppModule`: entra com a publicação de eventos.
+  mas ainda não é importado pelo `AppModule` (base para o futuro `/health/ready`).
+
+### Publisher da outbox
+
+Desligado por padrão. Para publicar os eventos gravados em `outbox_messages`, suba e provisione o
+SQS (`bun run sqs:up`) e defina `OUTBOX_PUBLISHER_ENABLED=true` no `.env`, além das variáveis do
+SQS acima. Várias instâncias podem publicar juntas. Garantias e decisões: `ARCHITECTURE.md`, seção
+"Publisher da outbox".
+
+| Variável                            | Padrão  | Uso                                                       |
+| ----------------------------------- | ------- | --------------------------------------------------------- |
+| `OUTBOX_PUBLISHER_ENABLED`          | `false` | `true` liga o publisher nesta instância                   |
+| `OUTBOX_PUBLISHER_POLL_INTERVAL_MS` | `500`   | Intervalo entre o fim de uma rodada e a próxima           |
+| `OUTBOX_PUBLISHER_MAX_GROUPS`       | `20`    | Máximo de wallets reservadas por rodada                   |
+| `OUTBOX_PUBLISHER_MAX_PER_GROUP`    | `50`    | Máximo de eventos reservados por wallet numa rodada       |
+| `OUTBOX_PUBLISHER_LEASE_MS`         | `30000` | Duração da reserva; depois dela, outro publisher assume   |
+| `OUTBOX_PUBLISHER_SEND_TIMEOUT_MS`  | `10000` | Timeout de cada envio; até metade da reserva              |
+| `OUTBOX_PUBLISHER_RETRY_BASE_MS`    | `1000`  | Espera após a primeira falha de envio; dobra a cada falha |
+| `OUTBOX_PUBLISHER_RETRY_MAX_MS`     | `60000` | Teto da espera; não há limite de tentativas               |
+
+Logs (JSON, sem payloads): `outbox_publish_round` (contagens), `outbox_publish_failed` (`eventId`,
+`walletId`, tentativa e nome do erro) e `outbox_publish_round_failed`.
 
 ## Testes
 

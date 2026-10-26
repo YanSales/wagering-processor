@@ -56,7 +56,7 @@ export function readPendingReferenceSettings(env: Env = process.env): PendingRef
   };
 }
 
-function readBoolean(env: Env, name: string, fallback: boolean): boolean {
+export function readBoolean(env: Env, name: string, fallback: boolean): boolean {
   const raw = env[name];
   if (raw === undefined || raw === '') return fallback;
   if (raw === 'true') return true;
@@ -64,7 +64,7 @@ function readBoolean(env: Env, name: string, fallback: boolean): boolean {
   throw new Error(`${name} inválida: "${raw}". Use true ou false.`);
 }
 
-function readPositiveInt(env: Env, name: string, fallback: number): number {
+export function readPositiveInt(env: Env, name: string, fallback: number): number {
   const raw = env[name];
   if (raw === undefined || raw === '') return fallback;
   const value = Number(raw);
