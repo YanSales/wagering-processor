@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { WagerTransactionKind, WagerTransactionStatus } from '../domain/wager-transaction';
 import { DEFAULT_REFERENCE_RETRY, ReferenceRetryPolicy } from './reference-retry-policy';
-import { decideRefund } from './refund-decision';
+import { decideRefund, decideRollback } from './refund-decision';
 import {
   type PendingReferenceRepository,
   type PendingReferenceTask,
@@ -44,7 +44,7 @@ export interface ReprocessOptions {
  * Uma rodada do worker agendado do contrato §7.1: tenta resolver as transações `PENDING_REFERENCE`
  * vencidas, uma transação SQL por item.
  *
- * Cada tentativa conta uma vez e reaplica a regra da submissão (`decideRefund`): referência válida →
+ * Cada tentativa conta uma vez e reaplica a regra da submissão (`decideRefund` ou `decideRollback`): referência válida →
  * `PROCESSED` com crédito; existente, mas inválida → `REJECTED`; ainda ausente → nova tentativa com
  * backoff exponencial ou, esgotado o limite, `REJECTED` com `REFERENCE_NOT_FOUND`.
  *
@@ -97,12 +97,18 @@ export class ReprocessPendingReferences {
         let decided: SubmissionDecision | undefined;
         const ledgerEntryId = this.#newId();
         const resolved = await this.pending.resolvePendingReference(task, at, (state) => {
-          if (state.transaction.kind !== WagerTransactionKind.Refund) {
+          const decide =
+            state.transaction.kind === WagerTransactionKind.Refund
+              ? decideRefund
+              : state.transaction.kind === WagerTransactionKind.Rollback
+                ? decideRollback
+                : undefined;
+          if (decide === undefined) {
             throw new Error(
               `${state.transaction.kind} em PENDING_REFERENCE não tem reprocessamento implementado.`,
             );
           }
-          decided = decideRefund({
+          decided = decide({
             transaction: state.transaction,
             wallet: state.wallet,
             reference: state.reference,

@@ -564,7 +564,14 @@ describe('POST /wagering/transactions: requisições recusadas sem efeito', () =
         money: { amount: '0.00', currency: 'BRL' },
       },
     ],
-    ['ROLLBACK', { kind: 'ROLLBACK', referenceExternalTransactionId: 'tx-0' }],
+    [
+      'ROLLBACK de valor zero',
+      {
+        kind: 'ROLLBACK',
+        referenceExternalTransactionId: 'tx-0',
+        money: { amount: '0.00', currency: 'BRL' },
+      },
+    ],
     ['BET de valor zero', { money: { amount: '0.00', currency: 'BRL' } }],
     ['BET com referência', { referenceExternalTransactionId: 'tx-0' }],
   ])('%s: 501 UNSUPPORTED_SUBMISSION, nada gravado', async (_case, overrides) => {

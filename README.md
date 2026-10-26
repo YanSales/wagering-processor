@@ -43,8 +43,13 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
 
 - `GET /health/ready` e `GET /metrics` (formato Prometheus) com as métricas do §12.
 
-Ainda **não há** processamento de WIN e LOSS com referência e ROLLBACK (a API e o consumidor os
-recusam), consultas da API nem autenticação (só o ponto de extensão).
+- ROLLBACK de BET, WIN ou REFUND, inclusive antes da referência (`PENDING_REFERENCE`), com
+  `REVERSAL_WOULD_OVERDRAW` para débito sem saldo (§7, regra 9);
+- consultas `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger` (cursor), as duas consultas de
+  transação e `POST /wallets/:walletId/reconciliation`.
+
+Ainda **não há** WIN e LOSS com referência (recusadas: o contrato não define as regras, ver
+`ARCHITECTURE.md`, "Dúvidas do contrato") nem autenticação (só o ponto de extensão).
 Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md). Esta seção é atualizada a cada
 etapa concluída; nada é descrito como pronto antes de estar implementado e verificado.
 

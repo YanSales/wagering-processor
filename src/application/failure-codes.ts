@@ -1,6 +1,7 @@
 import { WalletPlayerMismatchError } from '../domain/bet';
 import { CurrencyMismatchError } from '../domain/money';
 import { ReferenceAlreadyReversedError } from '../domain/refund';
+import { ReversalWouldOverdrawError } from '../domain/reversal';
 import { InvalidReferenceError, type ReferenceViolation } from '../domain/transaction-reference';
 import type { FailureCode } from '../domain/wager-transaction';
 import { InsufficientFundsError } from '../domain/wallet';
@@ -29,6 +30,11 @@ export const FailureCodes = {
   ReferenceAmountMismatch: 'REFERENCE_AMOUNT_MISMATCH',
   /** A referência já foi revertida pelo mesmo tipo de operação (§7, regra 4). */
   ReferenceAlreadyReversed: 'REFERENCE_ALREADY_REVERSED',
+  /**
+   * ROLLBACK de WIN ou REFUND (débito) que deixaria o saldo negativo (§7, regra 9). Distinto de
+   * `INSUFFICIENT_FUNDS`: não é aposta sem saldo, e a transação continua auditável.
+   */
+  ReversalWouldOverdraw: 'REVERSAL_WOULD_OVERDRAW',
 } as const satisfies Record<string, FailureCode>;
 
 /**
@@ -67,4 +73,10 @@ export function refundFailureCodeFor(error: unknown): FailureCode | undefined {
   if (error instanceof CurrencyMismatchError) return FailureCodes.CurrencyMismatch;
   if (error instanceof WalletPlayerMismatchError) return FailureCodes.PlayerWalletMismatch;
   return undefined;
+}
+
+/** Código de rejeição de um ROLLBACK: os do REFUND e a reversão que deixaria saldo negativo (regra 9). */
+export function rollbackFailureCodeFor(error: unknown): FailureCode | undefined {
+  if (error instanceof ReversalWouldOverdrawError) return FailureCodes.ReversalWouldOverdraw;
+  return refundFailureCodeFor(error);
 }

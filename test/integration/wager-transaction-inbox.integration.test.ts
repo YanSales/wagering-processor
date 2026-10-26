@@ -195,8 +195,9 @@ describe('consumidor: Inbox e efeito financeiro na mesma transação', () => {
     const wallet = await openWallet(1_000n);
     const insufficient = betMessage(wallet, 5_000n);
     const unknownWallet = betMessage({ walletId: randomUUID(), playerId: 'p' }, 100n);
+    // LOSS com referência: o contrato não define a regra; recusada sem gravar.
     const rollback = betMessage(wallet, 100n, {
-      kind: WagerTransactionKind.Rollback,
+      kind: WagerTransactionKind.Loss,
       referenceExternalTransactionId: 'bet-x',
     });
 

@@ -783,6 +783,63 @@ DLQ; 10 entregas paralelas em dois pools com um efeito) e
 ack e reenvio do produtor; mensagem mantida na fila quando o commit falha; DLQ direta com motivo;
 redrive para a DLQ depois de 5 recebimentos; ordem do grupo depois de uma falha).
 
+## ROLLBACK (contrato §7)
+
+`applyRollback` (`src/domain/rollback.ts`) e `decideRollback` (`src/application/refund-decision.ts`)
+seguem o REFUND: mesma leitura da referência sob o lock da wallet, mesma política de espera
+(`PENDING_REFERENCE`, worker do §7.1, esgotamento em `REFERENCE_NOT_FOUND`) e o mesmo caminho de
+gravação (transação, saldo, ledger, outbox e Inbox numa transação SQL).
+
+- Referencia BET, WIN ou REFUND `PROCESSED`, do mesmo provider, player, wallet, moeda e rodada, pelo
+  mesmo valor (regras 2, 3 e 5); outra referência é `REJECTED` com o código da violação.
+- Movimento inverso ao da referência (`ledgerDirectionFor`): BET → crédito; WIN ou REFUND → débito.
+- Regra 4: um ROLLBACK aplicado por referência, conferido sob o lock e garantido pelo índice
+  `wager_transactions_reversal_once_unique`; o segundo é `REJECTED REFERENCE_ALREADY_REVERSED`.
+- Regra 9: débito que deixaria o saldo negativo é `REJECTED REVERSAL_WOULD_OVERDRAW` (distinto de
+  `INSUFFICIENT_FUNDS`), sem lançamento e com o evento `WagerTransactionRejected`.
+- ROLLBACK de valor zero continua recusado (`UNSUPPORTED_SUBMISSION`): nenhuma referência válida tem
+  valor zero, e o contrato não define o caso.
+
+**Testes**: `test/unit/rollback-decision.test.ts` e
+`test/integration/rollback-processing.integration.test.ts` (PostgreSQL real: BET, WIN e REFUND
+revertidos, replay com o saldo original, regra 9, dois ROLLBACKs paralelos em dois pools, referência
+inválida, ROLLBACK antes da BET resolvido pelo worker e reconciliação consistente).
+
+## Dúvidas do contrato (não resolvidas por suposição)
+
+- **REFUND e ROLLBACK da mesma BET**: a regra 4 proíbe reverter duas vezes "pelo mesmo tipo"; o
+  schema e o processamento seguem a letra e aceitam um REFUND e um ROLLBACK da mesma BET (dois
+  créditos). Se o contrato quiser uma reversão por referência, qualquer tipo, falta a regra.
+- **WIN com referência**: o contrato diz só que a WIN "pode" referenciar a BET da mesma rodada. Não
+  define se a BET precisa estar `PROCESSED`, nem se uma BET ausente leva a WIN a esperar
+  (`PENDING_REFERENCE`, regra 8) ou a rejeita. Continua recusada (`UNSUPPORTED_SUBMISSION`).
+- **LOSS com referência**: o contrato não tem regra. Continua recusada.
+
+## Consultas e reconciliação (contrato §9)
+
+`QueriesModule` (`src/queries/`), sobre `MikroOrmQueryRepository`
+(`src/database/repositories/query.repository.ts`):
+
+- `GET /wallets/:walletId`: `{ id, playerId, balance, version }`, o formato de `POST /wallets`.
+- `GET /wallets/:walletId/ledger?cursor&limit`: do lançamento mais antigo ao mais recente,
+  `{ items, nextCursor }`. Paginação por conjunto de chaves `(created_at, id)`; o cursor é opaco
+  (o id do último item em base64url) e só vale para a mesma wallet. `limit` de 1 a 200, padrão 50
+  (o contrato só exemplifica 50).
+- `GET /wagering/transactions/:transactionId` e
+  `GET /providers/:providerId/wagering/transactions/:externalTransactionId`: a mesma visão da
+  transação (tipo, status, valores em `MoneyProps`, referências, `failureCode`, saldo observado ao
+  concluir em `balance`, datas).
+- `POST /wallets/:walletId/reconciliation`: `reconcileWallet` do domínio sobre a wallet lida com
+  `FOR SHARE` e todos os seus lançamentos, na mesma transação SQL (nenhuma movimentação no meio).
+  Divergência sai em `consistent: false` e no log `wallet_reconciliation_divergence`; nada é
+  corrigido.
+- Erros no formato comum `{ statusCode, error, message, code }`: 400 `INVALID_REQUEST`, 404
+  `WALLET_NOT_FOUND` ou `TRANSACTION_NOT_FOUND`.
+
+**Testes**: `test/integration/queries.http.integration.test.ts` (HTTP real: wallet, paginação
+completa sem repetição, cursor de outra wallet, limites inválidos, transação pelos dois ids,
+reconciliação consistente e divergência forçada, 404/400).
+
 ## Observabilidade (contrato §9 e §12)
 
 `ObservabilityModule` (`src/observability/`) expõe `GET /health/live`, `GET /health/ready` e
@@ -839,7 +896,7 @@ SQS não exigido quando desligado, métricas com o banco falhando), `test/integr
 
 ## Ainda não implementado
 
-WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), consultas e reconciliação pela API
-(`GET /wallets/:id`, ledger, transações) e autenticação real (§2). Política terminal (`FAILED`)
-para falhas operacionais persistentes do worker: decisão pendente (hoje, quarentena sem fim).
+WIN e LOSS com referência (ver "Dúvidas do contrato" acima) e autenticação real (§2). Política
+terminal (`FAILED`) para falhas operacionais persistentes do worker: decisão pendente (hoje,
+quarentena sem fim).
 Reprocessamento da DLQ: manual. Observabilidade sem OpenTelemetry nem dashboard (opcionais no §12).

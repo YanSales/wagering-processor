@@ -596,8 +596,12 @@ describe('SubmitWagerTransaction: submissões recusadas sem gravar', () => {
       }),
     ],
     [
-      'ROLLBACK (fora desta etapa)',
-      bet({ kind: WagerTransactionKind.Rollback, referenceExternalTransactionId: 'tx-0' }),
+      'ROLLBACK de valor zero (regra não definida)',
+      bet({
+        kind: WagerTransactionKind.Rollback,
+        referenceExternalTransactionId: 'tx-0',
+        money: brl(0n),
+      }),
     ],
     ['BET com referência (regra não definida)', bet({ referenceExternalTransactionId: 'tx-0' })],
     ['BET de valor zero (regra não definida)', bet({ money: brl(0n) })],

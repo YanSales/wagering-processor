@@ -12,7 +12,7 @@ import { applyWin } from '../domain/win';
 import { movementFailureCodeFor } from './failure-codes';
 import { computeWagerPayloadHash } from './payload-hash';
 import { DEFAULT_REFERENCE_RETRY, ReferenceRetryPolicy } from './reference-retry-policy';
-import { decideRefund } from './refund-decision';
+import { decideRefund, decideRollback } from './refund-decision';
 import type {
   ExistingSubmissions,
   InboxReceipt,
@@ -46,7 +46,7 @@ export interface SubmissionResult {
 }
 
 /**
- * Processa uma submissão de transação. Nesta etapa, `BET`, `WIN` e `LOSS` sem referência, e `REFUND`.
+ * Processa uma submissão de transação: `BET`, `WIN` e `LOSS` sem referência, `REFUND` e `ROLLBACK`.
  *
  * - Idempotência (§9): a mesma `idempotencyKey` com o mesmo `payloadHash` devolve o resultado
  *   original (`idempotentReplay: true`), inclusive o saldo observado na época (§7, regra 7); com
@@ -56,9 +56,10 @@ export interface SubmissionResult {
  *   (WIN) ou `applyLoss` só registra (LOSS, sem lançamento) e a transação vira `PROCESSED`, ou uma
  *   violação de negócio a torna `REJECTED` com `failureCode`, sem lançamento. Tudo na mesma
  *   transação SQL.
- * - REFUND (`decideRefund`): a BET referenciada é lida sob o mesmo lock. Válida, crédito e
- *   `PROCESSED`; existente, mas inválida, `REJECTED`; ausente, `PENDING_REFERENCE` com a próxima
- *   tentativa agendada para o worker do §7.1 (`ReprocessPendingReferences`), sem lançamento.
+ * - REFUND e ROLLBACK (`decideRefund`, `decideRollback`): a referência é lida sob o mesmo lock.
+ *   Válida, movimento (REFUND credita; ROLLBACK inverte a referência) e `PROCESSED`; existente, mas
+ *   inválida, ou ROLLBACK que deixaria saldo negativo, `REJECTED`; ausente, `PENDING_REFERENCE` com a
+ *   próxima tentativa agendada para o worker do §7.1, sem lançamento.
  * - Recusados sem gravar nada (`UnsupportedSubmissionError`): outros tipos (fora desta etapa) e
  *   casos sem regra definida (BET, WIN ou REFUND de valor zero; BET, WIN ou LOSS com referência).
  *   Wallet inexistente: `WalletNotFoundError`.
@@ -124,14 +125,15 @@ export class SubmitWagerTransaction {
       ...(inbox === undefined ? {} : { inbox }),
     };
 
+    const decideReversal = REVERSALS[command.kind as ReversalKind];
     const outcome =
-      command.kind === WagerTransactionKind.Refund
+      decideReversal !== undefined
         ? await this.transactions.applyToLockedWallet(
             command.walletId,
             keys,
             context,
             (wallet, reference) =>
-              decideRefund({
+              decideReversal({
                 transaction,
                 wallet,
                 reference,
@@ -143,7 +145,7 @@ export class SubmitWagerTransaction {
             {
               providerId: command.providerId,
               externalTransactionId: command.referenceExternalTransactionId as string,
-              reversalKind: WagerTransactionKind.Refund,
+              reversalKind: command.kind,
             },
           )
         : await this.transactions.applyToLockedWallet(command.walletId, keys, context, (wallet) => {
@@ -181,10 +183,16 @@ const MOVEMENTS = {
   [WagerTransactionKind.Loss]: applyLoss,
 } as const;
 type MovementKind = keyof typeof MOVEMENTS;
-/** Tipos processados: os movimentos sem referência e o REFUND (`decideRefund`). */
+/** Reversões: exigem a referência, lida sob o lock da wallet (§7, regras 1 a 5, 8 e 9). */
+const REVERSALS = {
+  [WagerTransactionKind.Refund]: decideRefund,
+  [WagerTransactionKind.Rollback]: decideRollback,
+} as const;
+type ReversalKind = keyof typeof REVERSALS;
+/** Tipos processados: os movimentos sem referência e as reversões (REFUND e ROLLBACK). */
 const SUPPORTED_KINDS: ReadonlySet<string> = new Set([
   ...Object.keys(MOVEMENTS),
-  WagerTransactionKind.Refund,
+  ...Object.keys(REVERSALS),
 ]);
 /** LOSS não move saldo: valor zero não esbarra em nenhuma invariante (ver `applyLoss`). */
 const ZERO_AMOUNT_ALLOWED: ReadonlySet<string> = new Set([WagerTransactionKind.Loss]);
@@ -197,11 +205,8 @@ function assertSupported(command: SubmitWagerTransactionCommand): void {
         : `o processamento de ${command.kind} ainda não está implementado.`,
     );
   }
-  // REFUND exige a referência (§7, regra 1), validada por `WagerTransaction.create`.
-  if (
-    command.kind !== WagerTransactionKind.Refund &&
-    command.referenceExternalTransactionId !== undefined
-  ) {
+  // REFUND e ROLLBACK exigem a referência (§7, regra 1), validada por `WagerTransaction.create`.
+  if (!(command.kind in REVERSALS) && command.referenceExternalTransactionId !== undefined) {
     throw new UnsupportedSubmissionError(
       command.kind === WagerTransactionKind.Win
         ? 'WIN com referência: o contrato não define o caso de uma BET referenciada que não ' +

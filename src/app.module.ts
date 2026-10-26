@@ -4,6 +4,7 @@ import { DatabaseModule } from './database/database.module';
 import { OutboxPublisherModule } from './messaging/outbox-publisher.module';
 import { WagerTransactionsConsumerModule } from './messaging/wager-transactions-consumer.module';
 import { ObservabilityModule } from './observability/observability.module';
+import { QueriesModule } from './queries/queries.module';
 import { WageringModule } from './wagering/wagering.module';
 import { WalletsModule } from './wallets/wallets.module';
 
@@ -16,6 +17,7 @@ import { WalletsModule } from './wallets/wallets.module';
     OutboxPublisherModule,
     WagerTransactionsConsumerModule,
     ObservabilityModule,
+    QueriesModule,
   ],
 })
 export class AppModule {}

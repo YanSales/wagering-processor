@@ -36,6 +36,7 @@ export const RequestErrorCodes = {
   IdempotencyKeyConflict: 'IDEMPOTENCY_KEY_CONFLICT',
   DuplicateExternalTransaction: 'DUPLICATE_EXTERNAL_TRANSACTION',
   WalletNotFound: 'WALLET_NOT_FOUND',
+  TransactionNotFound: 'TRANSACTION_NOT_FOUND',
   UnsupportedSubmission: 'UNSUPPORTED_SUBMISSION',
   TransientFailure: 'TRANSIENT_FAILURE',
 } as const;
@@ -151,7 +152,8 @@ function toRequestError(error: unknown): unknown {
   return error;
 }
 
-function requestError(status: HttpStatus, code: string, message: string): HttpException {
+/** Erro de requisição no formato comum da API: `{ statusCode, error, message, code }`. */
+export function requestError(status: HttpStatus, code: string, message: string): HttpException {
   return new HttpException(
     { statusCode: status, error: HttpStatusText[status] ?? 'Error', message, code },
     status,
