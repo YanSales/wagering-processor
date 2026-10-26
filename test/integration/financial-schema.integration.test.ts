@@ -80,22 +80,27 @@ interface TransactionRow {
   referenceExternalTransactionId?: string | null;
   referenceTransactionId?: string | null;
   failureCode?: string | null;
+  /** Saldo observado; por padrão `'0'` em submissões PROCESSED/REJECTED, que o exigem. */
+  resultBalanceCents?: string | null;
 }
 
 async function insertTransaction(row: TransactionRow) {
   const id = row.id ?? randomUUID();
   const kind = row.kind ?? 'BET';
+  const status = row.status ?? 'PENDING';
   const submission = row.submission ?? kind !== 'OPENING';
   const ext = row.externalTransactionId ?? `ext-${id}`;
+  const concluded = kind !== 'OPENING' && (status === 'PROCESSED' || status === 'REJECTED');
   await sql(
     `insert into wager_transactions (id, wallet_id, player_id, kind, status, provider_id, external_transaction_id,
        idempotency_key, payload_hash, round_id, game_id, money_cents, currency, reference_external_transaction_id,
-       reference_transaction_id, failure_code, created_at) values (?, ?, 'player-x', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())`,
+       reference_transaction_id, failure_code, result_balance_cents, created_at)
+       values (?, ?, 'player-x', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())`,
     [
       id,
       row.walletId,
       kind,
-      row.status ?? 'PENDING',
+      status,
       submission ? (row.providerId ?? 'provider-a') : null,
       submission ? ext : null,
       submission ? (row.idempotencyKey ?? `provider-a:${ext}`) : null,
@@ -107,6 +112,7 @@ async function insertTransaction(row: TransactionRow) {
       row.referenceExternalTransactionId ?? null,
       row.referenceTransactionId ?? null,
       row.failureCode ?? null,
+      row.resultBalanceCents === undefined ? (concluded ? '0' : null) : row.resultBalanceCents,
     ],
   );
   return id;
@@ -568,6 +574,40 @@ describe('wallet_ledger_entries', () => {
   });
 });
 
+describe('saldo observado de submissões concluídas (contrato §7, regra 7)', () => {
+  test.each(['PROCESSED', 'REJECTED'])('BET %s sem saldo observado é recusada', async (status) => {
+    const walletId = await insertWallet();
+
+    await expectRejected(
+      insertTransaction({
+        walletId,
+        status,
+        failureCode: status === 'REJECTED' ? 'INSUFFICIENT_FUNDS' : null,
+        resultBalanceCents: null,
+      }),
+      PG.CHECK,
+      'wager_transactions_result_balance_required_check',
+    );
+  });
+
+  test('BET PENDING e OPENING PROCESSED dispensam o saldo observado', async () => {
+    const walletId = await insertWallet({ balanceCents: '2500' });
+
+    await insertTransaction({ walletId, status: 'PENDING' });
+    await insertTransaction({ walletId, kind: 'OPENING', status: 'PROCESSED' });
+  });
+
+  test('saldo observado negativo é recusado', async () => {
+    const walletId = await insertWallet();
+
+    await expectRejected(
+      insertTransaction({ walletId, status: 'PROCESSED', resultBalanceCents: '-1' }),
+      PG.CHECK,
+      'wager_transactions_result_balance_check',
+    );
+  });
+});
+
 describe('migration e comparação de schema', () => {
   test(
     'a migration é revertida por completo e reaplicada',
@@ -585,12 +625,13 @@ describe('migration e comparação de schema', () => {
       const executed = (await orm.migrator.getExecuted()).map((m) => m.name);
       expect(executed.some((name) => name.endsWith('_financial_schema'))).toBe(true);
 
-      const reverted = await orm.migrator.down();
-      expect(reverted.map((m) => m.name)).toEqual(executed.slice(-1));
+      // Reverte todas as migrations, da mais recente à primeira, e reaplica na ordem.
+      const reverted = await orm.migrator.down({ to: 0 });
+      expect(reverted.map((m) => m.name)).toEqual([...executed].reverse());
       expect(await objects()).toEqual({ tables: 0, functions: 0, triggers: 0 });
 
       const reapplied = await orm.migrator.up();
-      expect(reapplied.map((m) => m.name)).toEqual(executed.slice(-1));
+      expect(reapplied.map((m) => m.name)).toEqual(executed);
       expect(await objects()).toEqual({ tables: 3, functions: 1, triggers: 1 });
     },
     DATABASE_BOOTSTRAP_TIMEOUT_MS,

@@ -18,10 +18,14 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
   dependência de framework;
 - `POST /wallets`: abertura atômica de wallet (com a transação interna `OPENING` e o lançamento de
   crédito quando o saldo inicial é positivo);
+- processamento de `BET` pelo caso de uso `SubmitWagerTransaction`: débito, lançamento e resultado na
+  mesma transação SQL, lock por wallet no PostgreSQL e idempotência persistente (sem endpoint HTTP
+  ainda);
 - SQS FIFO local (ElasticMQ), com provisionamento da fila `wager-events.fifo` e de sua DLQ.
 
-Ainda **não há** submissão ou processamento de transações, idempotência, Inbox/Outbox, publicação ou
-consumo de mensagens, consultas da API, autenticação (só o ponto de extensão) nem `GET /health/ready`.
+Ainda **não há** `POST /wagering/transactions`, processamento de WIN, LOSS, REFUND e ROLLBACK,
+Inbox/Outbox, publicação ou consumo de mensagens, consultas da API, autenticação (só o ponto de
+extensão) nem `GET /health/ready`.
 Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md). Esta seção é atualizada a cada
 etapa concluída; nada é descrito como pronto antes de estar implementado e verificado.
 

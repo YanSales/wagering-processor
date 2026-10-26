@@ -270,6 +270,23 @@
           "enumItems": [],
           "mappedType": "uuid"
         },
+        "result_balance_cents": {
+          "name": "result_balance_cents",
+          "type": "bigint",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "bigint"
+        },
         "round_id": {
           "name": "round_id",
           "type": "text",
@@ -410,6 +427,16 @@
           "name": "wager_transactions_reference_required_check",
           "expression": "kind not in ('REFUND', 'ROLLBACK') or reference_external_transaction_id is not null",
           "definition": "check (kind not in ('REFUND', 'ROLLBACK') or reference_external_transaction_id is not null)"
+        },
+        {
+          "name": "wager_transactions_result_balance_check",
+          "expression": "result_balance_cents is null or result_balance_cents >= 0",
+          "definition": "check (result_balance_cents is null or result_balance_cents >= 0)"
+        },
+        {
+          "name": "wager_transactions_result_balance_required_check",
+          "expression": "kind = 'OPENING' or status not in ('PROCESSED', 'REJECTED') or result_balance_cents is not null",
+          "definition": "check (kind = 'OPENING' or status not in ('PROCESSED', 'REJECTED') or result_balance_cents is not null)"
         },
         {
           "name": "wager_transactions_status_check",

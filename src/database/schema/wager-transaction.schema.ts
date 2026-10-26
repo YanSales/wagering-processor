@@ -22,6 +22,11 @@ export class WagerTransactionRecord {
   /** Transação referenciada já resolvida (id interno); preenchida quando a referência é aplicada. */
   referenceTransaction!: WagerTransactionRecord | null;
   failureCode!: string | null;
+  /**
+   * Saldo da wallet (na moeda da wallet) observado ao concluir a transação: devolvido no replay
+   * (contrato §7, regra 7), inclusive de uma rejeição, que não tem lançamento. `null` na `OPENING`.
+   */
+  resultBalanceCents!: bigint | null;
   createdAt!: Date;
   processedAt!: Date | null;
 }
@@ -48,8 +53,9 @@ const SUBMISSION_COLUMNS = [
  * - `OPENING` não tem campos de submissão nem referências; os demais tipos exigem os campos de
  *   submissão (§6.3), sem valores sintéticos.
  * A moeda não tem FK composta para a wallet: uma transação em moeda divergente precisa poder ser
- * persistida como REJECTED (auditável). O `failureCode` só tem o formato validado (taxonomia §7.2
- * pendente).
+ * persistida como REJECTED (auditável). O `failureCode` só tem o formato validado no banco; os
+ * códigos usados estão em `src/application/failure-codes.ts`.
+ * - submissão concluída (`PROCESSED`/`REJECTED`) guarda o saldo observado, não negativo.
  */
 export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
   class: WagerTransactionRecord,
@@ -84,6 +90,7 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
       foreignKeyName: 'wager_transactions_reference_transaction_id_fk',
     },
     failureCode: { type: 'text', nullable: true },
+    resultBalanceCents: { type: new BigIntType('bigint'), nullable: true },
     createdAt: { type: 'timestamptz' },
     processedAt: { type: 'timestamptz', nullable: true },
   },
@@ -122,6 +129,16 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
         `(kind = 'OPENING' and ${SUBMISSION_COLUMNS.map((c) => `${c} is null`).join(' and ')} ` +
         'and reference_external_transaction_id is null and reference_transaction_id is null) or ' +
         `(kind <> 'OPENING' and ${SUBMISSION_COLUMNS.map((c) => `${c} is not null`).join(' and ')})`,
+    },
+    {
+      name: 'wager_transactions_result_balance_check',
+      expression: 'result_balance_cents is null or result_balance_cents >= 0',
+    },
+    {
+      // O replay de uma submissão concluída precisa do saldo observado (§7, regra 7).
+      name: 'wager_transactions_result_balance_required_check',
+      expression:
+        "kind = 'OPENING' or status not in ('PROCESSED', 'REJECTED') or result_balance_cents is not null",
     },
   ],
 });
