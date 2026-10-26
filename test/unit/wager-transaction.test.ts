@@ -558,3 +558,83 @@ describe('WagerTransaction: PENDING_REFERENCE só é processada com a referênci
     expect(tx.referenceTransactionId).toBeUndefined();
   });
 });
+
+describe('WagerTransaction.opening: transação interna de abertura (contrato §9)', () => {
+  const opening = (
+    overrides: Partial<{
+      id: string;
+      walletId: string;
+      playerId: string;
+      money: Money;
+      at: Date;
+    }> = {},
+  ) =>
+    WagerTransaction.opening({
+      id: 'opening-1',
+      walletId: 'wallet-1',
+      playerId: 'player-1',
+      money: brl(100_000n),
+      at: T1,
+      ...overrides,
+    });
+
+  test('já nasce aplicada: PROCESSED, com processedAt e sem resultado de falha', () => {
+    const tx = opening();
+
+    expect(tx.kind).toBe(Opening);
+    expect(tx.status).toBe(Processed);
+    expect(tx.isTerminal()).toBe(true);
+    expect(tx.processedAt?.getTime()).toBe(T1.getTime());
+    expect(tx.createdAt.getTime()).toBe(T1.getTime());
+    expect(tx.failureCode).toBeUndefined();
+    expect(tx.money.equals(brl(100_000n))).toBe(true);
+  });
+
+  test('não tem dados de submissão nem referência: nada é inventado', () => {
+    const tx = opening();
+
+    expect({
+      providerId: tx.providerId,
+      externalTransactionId: tx.externalTransactionId,
+      idempotencyKey: tx.idempotencyKey,
+      payloadHash: tx.payloadHash,
+      roundId: tx.roundId,
+      gameId: tx.gameId,
+      referenceExternalTransactionId: tx.referenceExternalTransactionId,
+      referenceTransactionId: tx.referenceTransactionId,
+    }).toEqual({
+      providerId: undefined,
+      externalTransactionId: undefined,
+      idempotencyKey: undefined,
+      payloadHash: undefined,
+      roundId: undefined,
+      gameId: undefined,
+      referenceExternalTransactionId: undefined,
+      referenceTransactionId: undefined,
+    });
+    expect(tx.matchesPayload('qualquer')).toBe(false);
+  });
+
+  test('credita e afeta o saldo', () => {
+    const tx = opening();
+
+    expect(tx.affectsBalance()).toBe(true);
+    expect(tx.ledgerDirectionFor()).toBe(LedgerDirection.Credit);
+  });
+
+  test.each([
+    ['saldo zero (sem OPENING)', { money: brl(0n) }, 'saldo inicial positivo'],
+    ['saldo negativo', { money: brl(-1n) }, 'saldo inicial positivo'],
+    ['money que não é Money', { money: { cents: 1n } as unknown as Money }, 'Money'],
+    ['id vazio', { id: '' }, 'id deve ser'],
+    ['walletId vazio', { walletId: ' ' }, 'walletId deve ser'],
+    ['playerId vazio', { playerId: '' }, 'playerId deve ser'],
+    ['data inválida', { at: new Date('invalid') }, 'data válida'],
+  ])('rejeita %s', (_case, overrides, message) => {
+    expect(() => opening(overrides)).toThrow(message);
+  });
+
+  test('a submissão pública continua recusando OPENING', () => {
+    expect(() => create(Opening)).toThrow('OPENING é interno');
+  });
+});

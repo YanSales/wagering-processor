@@ -46,7 +46,27 @@ export interface CreateWagerTransactionProps {
   createdAt: Date;
 }
 
-export interface WagerTransactionState extends CreateWagerTransactionProps {
+/** Campos que só existem em transações submetidas (API/fila); a `OPENING` interna não os tem. */
+export type SubmissionField =
+  | 'providerId'
+  | 'externalTransactionId'
+  | 'idempotencyKey'
+  | 'payloadHash'
+  | 'roundId'
+  | 'gameId';
+
+export interface OpenWagerTransactionProps {
+  id: string;
+  walletId: string;
+  playerId: string;
+  /** Saldo inicial da wallet; precisa ser positivo (§9: OPENING só quando o saldo inicial é > 0). */
+  money: Money;
+  at: Date;
+}
+
+export interface WagerTransactionState
+  extends Omit<CreateWagerTransactionProps, SubmissionField>,
+    Partial<Pick<CreateWagerTransactionProps, SubmissionField>> {
   status: WagerTransactionStatus;
   referenceTransactionId?: string;
   failureCode?: FailureCode;
@@ -100,14 +120,14 @@ export class WagerTransaction {
 
   private constructor(
     readonly id: string,
-    readonly providerId: string,
-    readonly externalTransactionId: string,
-    readonly idempotencyKey: string,
-    readonly payloadHash: string,
+    readonly providerId: string | undefined,
+    readonly externalTransactionId: string | undefined,
+    readonly idempotencyKey: string | undefined,
+    readonly payloadHash: string | undefined,
     readonly walletId: string,
     readonly playerId: string,
-    readonly roundId: string,
-    readonly gameId: string,
+    readonly roundId: string | undefined,
+    readonly gameId: string | undefined,
     readonly kind: WagerTransactionKind,
     readonly money: Money,
     readonly referenceExternalTransactionId: string | undefined,
@@ -169,6 +189,37 @@ export class WagerTransaction {
     assertValidDate('createdAt', props.createdAt);
 
     return WagerTransaction.rehydrate({ ...props, status: WagerTransactionStatus.Pending });
+  }
+
+  /**
+   * Cria a transação interna `OPENING` do crédito de abertura (contrato §9), já aplicada: nasce em
+   * `PENDING` e passa a `PROCESSED` pela máquina de estados, porque wallet, OPENING e lançamento são
+   * gravados na mesma transação SQL. Não tem campos de submissão nem referência: nenhum dado externo
+   * é inventado. Exige valor positivo (com saldo inicial zero não há OPENING).
+   */
+  static opening(props: OpenWagerTransactionProps): WagerTransaction {
+    for (const name of ['id', 'walletId', 'playerId'] as const) {
+      assertNonEmpty(name, props[name]);
+    }
+    if (!(props.money instanceof Money)) {
+      throw new InvalidWagerTransactionError('money deve ser uma instância de Money.');
+    }
+    if (props.money.isZero() || props.money.isNegative()) {
+      throw new InvalidWagerTransactionError('a OPENING exige saldo inicial positivo.');
+    }
+    assertValidDate('at', props.at);
+
+    const opening = WagerTransaction.rehydrate({
+      id: props.id,
+      walletId: props.walletId,
+      playerId: props.playerId,
+      kind: WagerTransactionKind.Opening,
+      money: props.money,
+      createdAt: props.at,
+      status: WagerTransactionStatus.Pending,
+    });
+    opening.markProcessed(undefined, props.at);
+    return opening;
   }
 
   /** Reconstrução a partir da persistência; não revalida transições (contrato §6.0). */
