@@ -11,8 +11,9 @@ export interface RefundInput {
   /** BET resolvida por `(providerId, referenceExternalTransactionId)`, ou `undefined` se ausente. */
   reference: WagerTransaction | undefined;
   /**
-   * `true` se a referência já foi revertida por um REFUND aplicado (§7, regra 4). Vem da persistência,
-   * que o consulta sob o lock da wallet; o índice único do banco é a garantia final.
+   * `true` se a referência já foi revertida por uma reversão aplicada de qualquer tipo, REFUND ou
+   * ROLLBACK (no máximo uma reversão por operação). Vem da persistência, que o consulta sob o lock
+   * da wallet; o índice único do banco é a garantia final.
    */
   alreadyRefunded: boolean;
   /** Wallet da transação, já protegida contra concorrência pela persistência. */

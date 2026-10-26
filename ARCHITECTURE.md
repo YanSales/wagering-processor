@@ -244,14 +244,15 @@ SQS.
   - wallet de outro player ou moeda diferente da wallet → `REJECTED` (`PLAYER_WALLET_MISMATCH`,
     `CURRENCY_MISMATCH`), verificados antes da referência;
   - BET válida (mesmo player, wallet, moeda e rodada; tipo BET; `PROCESSED`; mesmo valor, regras 2,
-    3 e 5) e ainda não reembolsada (regra 4) → crédito, `PROCESSED`, com o id interno da BET em
+    3 e 5) e ainda não revertida (regra 4, ver "Uma reversão por operação") → crédito, `PROCESSED`,
+    com o id interno da BET em
     `reference_transaction_id`;
   - BET existente, mas inválida → `REJECTED` **de imediato**, com o código da violação (decisão
     aprovada para o projeto: a referência existe e não vai mudar; esperar não a tornaria válida);
   - BET ausente → `PENDING_REFERENCE` (regra 8), seção seguinte.
-  - Regra 4: a persistência informa, sob o lock, se a BET já tem um REFUND `PROCESSED`; o índice
-    único `wager_transactions_reversal_once_unique` é a garantia final. Só o REFUND aplicado grava
-    `reference_transaction_id`: uma rejeição não ocupa o índice.
+  - Regra 4: a persistência informa, sob o lock, se a BET já tem uma reversão `PROCESSED` (REFUND
+    ou ROLLBACK); o índice único `wager_transactions_reversal_once_unique` é a garantia final. Só a
+    reversão aplicada grava `reference_transaction_id`: uma rejeição não ocupa o índice.
   - Valor `0.00` é recusado (501), como BET e WIN: nunca seria igual ao de uma BET aplicada, e a
     regra não está definida. A regra 9 (reversão que deixaria saldo negativo) não se aplica a um
     crédito.
@@ -793,8 +794,8 @@ gravação (transação, saldo, ledger, outbox e Inbox numa transação SQL).
 - Referencia BET, WIN ou REFUND `PROCESSED`, do mesmo provider, player, wallet, moeda e rodada, pelo
   mesmo valor (regras 2, 3 e 5); outra referência é `REJECTED` com o código da violação.
 - Movimento inverso ao da referência (`ledgerDirectionFor`): BET → crédito; WIN ou REFUND → débito.
-- Regra 4: um ROLLBACK aplicado por referência, conferido sob o lock e garantido pelo índice
-  `wager_transactions_reversal_once_unique`; o segundo é `REJECTED REFERENCE_ALREADY_REVERSED`.
+- Regra 4: uma reversão aplicada por referência, de qualquer tipo (seção "Uma reversão por
+  operação"); a segunda é `REJECTED REFERENCE_ALREADY_REVERSED`.
 - Regra 9: débito que deixaria o saldo negativo é `REJECTED REVERSAL_WOULD_OVERDRAW` (distinto de
   `INSUFFICIENT_FUNDS`), sem lançamento e com o evento `WagerTransactionRejected`.
 - ROLLBACK de valor zero continua recusado (`UNSUPPORTED_SUBMISSION`): nenhuma referência válida tem
@@ -805,11 +806,40 @@ gravação (transação, saldo, ledger, outbox e Inbox numa transação SQL).
 revertidos, replay com o saldo original, regra 9, dois ROLLBACKs paralelos em dois pools, referência
 inválida, ROLLBACK antes da BET resolvido pelo worker e reconciliação consistente).
 
+## Uma reversão por operação (regra 4)
+
+**Regra do projeto**: uma operação original é revertida **no máximo uma vez no total**, seja por
+REFUND, seja por ROLLBACK. O texto do contrato proíbe só reverter duas vezes "pelo mesmo tipo de
+operação"; segui-lo à letra permitiria um REFUND e um ROLLBACK da mesma BET, creditando o valor duas
+vezes. A regra mais restrita foi adotada por integridade financeira (decisão registrada; se o
+contrato quiser o contrário, é a única linha que muda).
+
+- **Sob o lock da wallet**: a leitura da referência (`findReferenceIn`) informa se ela já tem uma
+  reversão `PROCESSED` de qualquer tipo; a decisão vira `REJECTED REFERENCE_ALREADY_REVERSED`, sem
+  lançamento, com o evento `WagerTransactionRejected`. A referência é sempre da mesma wallet (regra
+  2), então duas reversões concorrentes da mesma operação — de tipos iguais ou diferentes — se
+  serializam no `FOR UPDATE` da wallet, e a segunda vê a primeira.
+- **Garantia final no banco**: o índice único parcial `wager_transactions_reversal_once_unique`
+  passou de `(reference_transaction_id, kind)` para `(reference_transaction_id)`, restrito a
+  REFUND/ROLLBACK com a referência resolvida (migration `Migration20261026182136_reversal_once_per_reference`).
+  Só reversões aplicadas gravam a referência interna: pendentes e rejeitadas não ocupam o índice.
+- **Pendências**: um REFUND ou ROLLBACK em `PENDING_REFERENCE` cuja referência for revertida antes
+  por outro é rejeitado pelo worker com o mesmo código.
+- **Reversão de uma reversão**: um ROLLBACK de um REFUND continua permitido, porque reverte outra
+  operação (o REFUND), que também só pode ser revertida uma vez.
+- **Código de erro**: reutiliza `REFERENCE_ALREADY_REVERSED` (HTTP 422, como toda rejeição de
+  negócio); o contrato de erro da API não mudou.
+- **Dados existentes**: se o banco já tiver uma operação com REFUND e ROLLBACK aplicados, a
+  migration falha e é desfeita; a duplicidade precisa ser reconciliada manualmente.
+
+**Testes**: `test/integration/rollback-processing.integration.test.ts` (REFUND→ROLLBACK e
+ROLLBACK→REFUND, os dois tipos em paralelo em dois pools em 5 rodadas, replays idempotentes sem novo
+evento, REFUND pendente rejeitado pelo worker, ROLLBACK de REFUND permitido, saldo, ledger e outbox
+alterados uma vez) e `test/integration/financial-schema.integration.test.ts` (o índice recusa a
+segunda reversão de qualquer tipo).
+
 ## Dúvidas do contrato (não resolvidas por suposição)
 
-- **REFUND e ROLLBACK da mesma BET**: a regra 4 proíbe reverter duas vezes "pelo mesmo tipo"; o
-  schema e o processamento seguem a letra e aceitam um REFUND e um ROLLBACK da mesma BET (dois
-  créditos). Se o contrato quiser uma reversão por referência, qualquer tipo, falta a regra.
 - **WIN com referência**: o texto do contrato (§7, tabela) é só "pode referenciar a `BET` da mesma
   rodada"; a regra 2 exige mesmo provider, player, wallet, moeda e rodada, e a regra 3 não cita a
   WIN. Não define se a BET precisa estar `PROCESSED` (o "`PROCESSED`, valor igual" da tabela é das

@@ -145,7 +145,6 @@ export class SubmitWagerTransaction {
             {
               providerId: command.providerId,
               externalTransactionId: command.referenceExternalTransactionId as string,
-              reversalKind: command.kind,
             },
           )
         : await this.transactions.applyToLockedWallet(command.walletId, keys, context, (wallet) => {

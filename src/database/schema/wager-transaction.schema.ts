@@ -124,8 +124,9 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
       properties: ['providerId', 'externalTransactionId'],
     },
     {
+      // Uma operação é revertida no máximo uma vez no total, por REFUND ou por ROLLBACK.
       name: 'wager_transactions_reversal_once_unique',
-      properties: ['referenceTransaction', 'kind'],
+      properties: ['referenceTransaction'],
       where: "kind in ('REFUND', 'ROLLBACK') and reference_transaction_id is not null",
     },
     {

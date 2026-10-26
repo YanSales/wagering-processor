@@ -183,7 +183,6 @@ export class MikroOrmWagerTransactionRepository
         const reference = await findReferenceIn(em, {
           providerId: pending.providerId as string,
           externalTransactionId: pending.referenceExternalTransactionId as string,
-          reversalKind: pending.kind,
         });
         const decision = decide({
           transaction: pending,
@@ -525,8 +524,11 @@ function toTransaction(row: TransactionRow): WagerTransaction {
 
 /**
  * Transação resolvida por `(providerId, externalTransactionId)` (§7, regra 2; única pelo `UNIQUE`)
- * e se ela já foi revertida por uma transação `PROCESSED` do tipo da consulta (regra 4). Só uma
- * reversão aplicada grava `reference_transaction_id`; o índice único parcial é a garantia final.
+ * e se ela já foi revertida por qualquer reversão `PROCESSED` — REFUND ou ROLLBACK: uma operação é
+ * revertida no máximo uma vez no total. Lida sob o lock da wallet, que serializa as reversões da
+ * mesma operação (a referência é sempre da mesma wallet, regra 2). Só uma reversão aplicada grava
+ * `reference_transaction_id`; o índice único parcial `wager_transactions_reversal_once_unique` é a
+ * garantia final.
  */
 async function findReferenceIn(
   em: EntityManager,
@@ -535,11 +537,12 @@ async function findReferenceIn(
   const [row] = (await em.getConnection().execute(
     `select ${TRANSACTION_COLUMNS},
             exists (select 1 from wager_transactions r
-                     where r.reference_transaction_id = t.id and r.kind = ?
+                     where r.reference_transaction_id = t.id
+                       and r.kind in ('REFUND', 'ROLLBACK')
                        and r.status = 'PROCESSED') as already_reversed
        from wager_transactions t
       where t.provider_id = ? and t.external_transaction_id = ?`,
-    [query.reversalKind, query.providerId, query.externalTransactionId],
+    [query.providerId, query.externalTransactionId],
     'all',
     em.getTransactionContext(),
   )) as (TransactionRow & { already_reversed: boolean })[];

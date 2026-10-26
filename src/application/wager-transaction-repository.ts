@@ -2,7 +2,6 @@ import type { Money } from '../domain/money';
 import type {
   FailureCode,
   WagerTransaction,
-  WagerTransactionKind,
   WagerTransactionStatus,
 } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
@@ -75,14 +74,15 @@ export interface ReferenceQuery {
   providerId: string;
   /** `referenceExternalTransactionId` da transação que referencia. */
   externalTransactionId: string;
-  /** Tipo da reversão, para a regra 4 (`REFUND` ou `ROLLBACK`). */
-  reversalKind: WagerTransactionKind;
 }
 
 /** Transação referenciada, lida sob o lock da wallet da transação que a referencia. */
 export interface ResolvedReference {
   transaction: WagerTransaction;
-  /** Já revertida por uma transação `PROCESSED` do tipo da consulta (§7, regra 4). */
+  /**
+   * Já revertida por uma reversão `PROCESSED` de qualquer tipo (REFUND ou ROLLBACK): uma operação é
+   * revertida no máximo uma vez no total (§7, regra 4, na interpretação adotada; ver `ARCHITECTURE.md`).
+   */
   alreadyReversed: boolean;
 }
 

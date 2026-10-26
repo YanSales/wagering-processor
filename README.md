@@ -45,6 +45,8 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
 
 - ROLLBACK de BET, WIN ou REFUND, inclusive antes da referência (`PENDING_REFERENCE`), com
   `REVERSAL_WOULD_OVERDRAW` para débito sem saldo (§7, regra 9);
+- uma reversão por operação original, no total (um REFUND **ou** um ROLLBACK, nunca os dois):
+  a segunda é `REJECTED` com `REFERENCE_ALREADY_REVERSED` (ver `ARCHITECTURE.md`);
 - consultas `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger` (cursor), as duas consultas de
   transação e `POST /wallets/:walletId/reconciliation`.
 

@@ -242,3 +242,149 @@ describe('ROLLBACK com o PostgreSQL real', () => {
     await expectConsistent(wallet.walletId);
   });
 });
+
+const refundOf = (wallet: WalletRef, reference: SubmitWagerTransactionCommand) =>
+  command(WagerTransactionKind.Refund, wallet, reference.money.cents, {
+    referenceExternalTransactionId: reference.externalTransactionId,
+  });
+
+/** Eventos da outbox de uma transação, em ordem. */
+const eventsOf = async (transactionId: string) =>
+  (
+    await sql<{ event_type: string; code: string | null }>(
+      `select event_type, payload -> 'data' ->> 'failureCode' as code from outbox_messages
+        where transaction_id = ? order by seq`,
+      [transactionId],
+    )
+  ).map((e) => (e.code === null ? e.event_type : `${e.event_type}:${e.code}`));
+
+describe('uma reversão por operação, qualquer que seja o tipo (REFUND ou ROLLBACK)', () => {
+  test.each([
+    ['REFUND seguido de ROLLBACK', refundOf, rollbackOf],
+    ['ROLLBACK seguido de REFUND', rollbackOf, refundOf],
+  ])('%s: a segunda é REJECTED, saldo e ledger mudam uma vez', async (_case, first, second) => {
+    const wallet = await openWallet(10_000n);
+    const bet = command(WagerTransactionKind.Bet, wallet, 3_000n);
+    await submit.execute(bet);
+
+    const applied = await submit.execute(first(wallet, bet));
+    const refused = await submit.execute(second(wallet, bet));
+
+    expect(applied.status).toBe(Processed);
+    expect(refused).toMatchObject({
+      status: Rejected,
+      failureCode: 'REFERENCE_ALREADY_REVERSED',
+    });
+    expect(refused.balance.cents).toBe(10_000n);
+    // Abertura, débito da BET e um único crédito de reversão.
+    expect(await walletState(wallet.walletId)).toMatchObject({ balance: '10000', entries: 3 });
+    expect(await eventsOf(applied.transactionId)).toEqual([
+      'WagerTransactionProcessed',
+      'WalletBalanceChanged',
+    ]);
+    expect(await eventsOf(refused.transactionId)).toEqual([
+      'WagerTransactionRejected:REFERENCE_ALREADY_REVERSED',
+    ]);
+    const [reversals] = await sql<{ n: number }>(
+      `select count(*)::int as n from wager_transactions t join wager_transactions b
+         on b.id = t.reference_transaction_id where b.external_transaction_id = ?`,
+      [bet.externalTransactionId],
+    );
+    expect(reversals?.n).toBe(1);
+    await expectConsistent(wallet.walletId);
+  });
+
+  test('REFUND e ROLLBACK da mesma BET em paralelo, em dois pools: exatamente um aplicado', async () => {
+    for (let round = 0; round < 5; round += 1) {
+      const wallet = await openWallet(10_000n);
+      const bet = command(WagerTransactionKind.Bet, wallet, 3_000n);
+      await submit.execute(bet);
+      const refund = refundOf(wallet, bet);
+      const rollback = rollbackOf(wallet, bet);
+
+      // Alterna qual pool recebe cada tipo, para não favorecer um deles.
+      const [a, b] = round % 2 === 0 ? [submit, submitElsewhere] : [submitElsewhere, submit];
+      const results = await Promise.all([a.execute(refund), b.execute(rollback)]);
+
+      expect(results.map((r) => r.status).sort()).toEqual([Processed, Rejected].sort());
+      const loser = results.find((r) => r.status === Rejected);
+      expect(loser?.failureCode).toBe('REFERENCE_ALREADY_REVERSED');
+      expect(await walletState(wallet.walletId)).toMatchObject({ balance: '10000', entries: 3 });
+      const balanceChanges = await sql<{ n: number }>(
+        `select count(*)::int as n from outbox_messages
+          where message_group_id = ? and event_type = 'WalletBalanceChanged'`,
+        [wallet.walletId],
+      );
+      // Abertura, BET e uma única reversão.
+      expect(balanceChanges[0]?.n).toBe(3);
+
+      // Replays idempotentes devolvem os resultados originais, sem novo efeito nem evento.
+      const before = await sql<{ n: number }>(
+        'select count(*)::int as n from outbox_messages where message_group_id = ?',
+        [wallet.walletId],
+      );
+      const replays = await Promise.all([
+        submit.execute(refund),
+        submitElsewhere.execute(rollback),
+      ]);
+      expect(replays.every((r) => r.idempotentReplay)).toBe(true);
+      expect(replays.map((r) => r.status)).toEqual(results.map((r) => r.status));
+      const after = await sql<{ n: number }>(
+        'select count(*)::int as n from outbox_messages where message_group_id = ?',
+        [wallet.walletId],
+      );
+      expect(after[0]?.n).toBe(before[0]?.n);
+      await expectConsistent(wallet.walletId);
+    }
+  });
+
+  test('REFUND pendente perde para um ROLLBACK aplicado antes: o worker o rejeita', async () => {
+    const wallet = await openWallet(10_000n);
+    const bet = command(WagerTransactionKind.Bet, wallet, 3_000n);
+    const refund = refundOf(wallet, bet);
+
+    expect((await submit.execute(refund)).status).toBe(PendingReference);
+    await submit.execute(bet);
+    expect((await submit.execute(rollbackOf(wallet, bet))).status).toBe(Processed);
+
+    const real = new MikroOrmWagerTransactionRepository(orm);
+    const scoped: PendingReferenceRepository = {
+      async findDuePendingReferences(now, limit) {
+        const due = await real.findDuePendingReferences(now, 10_000);
+        return due.filter((t) => t.walletId === wallet.walletId).slice(0, limit);
+      },
+      resolvePendingReference: (task, now, decide) =>
+        real.resolvePendingReference(task, now, decide),
+      deferAfterFailure: (task, now, next) => real.deferAfterFailure(task, now, next),
+    };
+    const summary = await new ReprocessPendingReferences(scoped, {
+      batchSize: 10,
+      now: () => new Date(Date.now() + 600_000),
+    }).runOnce();
+
+    expect(summary.rejected).toBe(1);
+    expect(await submit.execute(refund)).toMatchObject({
+      status: Rejected,
+      failureCode: 'REFERENCE_ALREADY_REVERSED',
+      idempotentReplay: true,
+    });
+    expect(await walletState(wallet.walletId)).toMatchObject({ balance: '10000', entries: 3 });
+    await expectConsistent(wallet.walletId);
+  });
+
+  test('ROLLBACK de um REFUND continua permitido: reverte outra operação (o REFUND)', async () => {
+    const wallet = await openWallet(10_000n);
+    const bet = command(WagerTransactionKind.Bet, wallet, 3_000n);
+    await submit.execute(bet);
+    const refund = refundOf(wallet, bet);
+    await submit.execute(refund);
+
+    expect((await submit.execute(rollbackOf(wallet, refund))).status).toBe(Processed);
+    // A BET já foi revertida pelo REFUND: um ROLLBACK dela é recusado.
+    expect((await submit.execute(rollbackOf(wallet, bet))).failureCode).toBe(
+      'REFERENCE_ALREADY_REVERSED',
+    );
+    expect(await walletState(wallet.walletId)).toMatchObject({ balance: '7000', entries: 4 });
+    await expectConsistent(wallet.walletId);
+  });
+});

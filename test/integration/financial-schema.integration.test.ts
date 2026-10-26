@@ -412,12 +412,22 @@ describe('reversões: unicidade por referência e tipo (contrato §7, regra 4)',
     },
   );
 
-  test('permite um REFUND e um ROLLBACK distintos da mesma referência', async () => {
-    const { walletId, betId } = await processedBet();
-    await reversal(walletId, betId, 'REFUND');
+  test.each([
+    ['REFUND', 'ROLLBACK'],
+    ['ROLLBACK', 'REFUND'],
+  ] as const)(
+    'rejeita %s seguido de %s da mesma referência: uma reversão por operação',
+    async (first, second) => {
+      const { walletId, betId } = await processedBet();
+      await reversal(walletId, betId, first);
 
-    expect(await reversal(walletId, betId, 'ROLLBACK')).toBeString();
-  });
+      await expectRejected(
+        reversal(walletId, betId, second),
+        PG.UNIQUE,
+        'wager_transactions_reversal_once_unique',
+      );
+    },
+  );
 
   test('reversões ainda sem referência resolvida não colidem', async () => {
     const walletId = await insertWallet();

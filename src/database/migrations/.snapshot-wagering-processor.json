@@ -988,10 +988,9 @@
         },
         {
           "columnNames": [
-            "reference_transaction_id",
-            "kind"
+            "reference_transaction_id"
           ],
-          "composite": true,
+          "composite": false,
           "constraint": false,
           "keyName": "wager_transactions_reversal_once_unique",
           "primary": false,

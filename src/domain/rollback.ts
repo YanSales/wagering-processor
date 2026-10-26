@@ -12,8 +12,9 @@ export interface RollbackInput {
   /** BET, WIN ou REFUND resolvida por `(providerId, referenceExternalTransactionId)`, ou `undefined`. */
   reference: WagerTransaction | undefined;
   /**
-   * `true` se a referência já foi revertida por um ROLLBACK aplicado (§7, regra 4). Vem da
-   * persistência, sob o lock da wallet; o índice único do banco é a garantia final.
+   * `true` se a referência já foi revertida por uma reversão aplicada de qualquer tipo, ROLLBACK ou
+   * REFUND (no máximo uma reversão por operação). Vem da persistência, sob o lock da wallet; o
+   * índice único do banco é a garantia final.
    */
   alreadyRolledBack: boolean;
   wallet: Wallet;

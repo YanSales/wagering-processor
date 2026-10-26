@@ -58,7 +58,7 @@ class InMemoryWagerTransactionRepository implements WagerTransactionRepository {
     const alreadyReversed = this.transactions.some(
       (t) =>
         t.referenceTransactionId === reference.id &&
-        t.kind === query.reversalKind &&
+        (t.kind === WagerTransactionKind.Refund || t.kind === WagerTransactionKind.Rollback) &&
         t.status === WagerTransactionStatus.Processed,
     );
     return { transaction: reference, alreadyReversed };
