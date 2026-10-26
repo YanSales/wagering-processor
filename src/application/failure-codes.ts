@@ -18,8 +18,8 @@ export const FailureCodes = {
 } as const satisfies Record<string, FailureCode>;
 
 /**
- * Código de rejeição de negócio para um erro de domínio de uma movimentação (BET, WIN), ou
- * `undefined` se não for um. O WIN só produz `CURRENCY_MISMATCH` e `PLAYER_WALLET_MISMATCH`.
+ * Código de rejeição de negócio para um erro de domínio de uma submissão (BET, WIN, LOSS), ou
+ * `undefined` se não for um. WIN e LOSS só produzem `CURRENCY_MISMATCH` e `PLAYER_WALLET_MISMATCH`.
  */
 export function movementFailureCodeFor(error: unknown): FailureCode | undefined {
   if (error instanceof InsufficientFundsError) return FailureCodes.InsufficientFunds;

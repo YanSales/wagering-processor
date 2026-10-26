@@ -320,6 +320,72 @@ describe('SubmitWagerTransaction: WIN sem referência', () => {
   });
 });
 
+describe('SubmitWagerTransaction: LOSS sem referência', () => {
+  const loss = (overrides: Partial<SubmitWagerTransactionCommand> = {}) =>
+    bet({
+      kind: WagerTransactionKind.Loss,
+      idempotencyKey: 'provider-a:loss-1',
+      externalTransactionId: 'loss-1',
+      money: brl(5_000n),
+      ...overrides,
+    });
+
+  test('PROCESSED: saldo e versão inalterados, nenhum lançamento, saldo observado gravado', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(2_000n);
+
+    const result = await useCase.execute(loss());
+
+    expect(result).toMatchObject({ status: Processed, idempotentReplay: false });
+    expect(result.failureCode).toBeUndefined();
+    expect(result.balance.cents).toBe(2_000n);
+    expect(repository.wallets.get('wallet-1')).toMatchObject({ version: 1 });
+    expect(repository.wallets.get('wallet-1')?.balance.cents).toBe(2_000n);
+    expect(repository.entries).toEqual([]);
+    expect(repository.submissions.map((s) => s.status)).toEqual([Processed]);
+  });
+
+  test('valor zero é registrado como LOSS processado', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(2_000n);
+
+    const result = await useCase.execute(loss({ money: brl(0n) }));
+
+    expect(result.status).toBe(Processed);
+    expect(repository.entries).toEqual([]);
+  });
+
+  test.each([
+    ['moeda incompatível', { money: Money.fromCents(100n, 'USD') }, FailureCodes.CurrencyMismatch],
+    ['wallet de outro player', { playerId: 'player-2' }, FailureCodes.PlayerWalletMismatch],
+  ])('%s: REJECTED com failureCode, sem lançamento', async (_case, overrides, code) => {
+    const { repository, useCase } = setup();
+    repository.addWallet(2_000n);
+
+    const result = await useCase.execute(loss(overrides));
+
+    expect(result).toMatchObject({ status: Rejected, failureCode: code });
+    expect(result.balance.cents).toBe(2_000n);
+    expect(repository.entries).toEqual([]);
+  });
+
+  test('replay devolve o resultado original; conflito e operação duplicada não registram de novo', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(2_000n);
+    const first = await useCase.execute(loss());
+
+    expect(await useCase.execute(loss())).toEqual({ ...first, idempotentReplay: true });
+    await expect(useCase.execute(loss({ money: brl(5_001n) }))).rejects.toBeInstanceOf(
+      IdempotencyConflictError,
+    );
+    await expect(useCase.execute(loss({ idempotencyKey: 'outra' }))).rejects.toBeInstanceOf(
+      DuplicateExternalTransactionError,
+    );
+    expect(repository.submissions).toHaveLength(1);
+    expect(repository.decideCalls).toBe(1);
+  });
+});
+
 describe('SubmitWagerTransaction: submissões recusadas sem gravar', () => {
   test.each([
     ['OPENING (interno)', bet({ kind: WagerTransactionKind.Opening })],
@@ -331,7 +397,10 @@ describe('SubmitWagerTransaction: submissões recusadas sem gravar', () => {
       'WIN de valor zero (regra não definida)',
       bet({ kind: WagerTransactionKind.Win, money: brl(0n) }),
     ],
-    ['LOSS (fora desta etapa)', bet({ kind: WagerTransactionKind.Loss })],
+    [
+      'LOSS com referência (regra não definida)',
+      bet({ kind: WagerTransactionKind.Loss, referenceExternalTransactionId: 'tx-0' }),
+    ],
     [
       'REFUND (fora desta etapa)',
       bet({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'tx-0' }),
