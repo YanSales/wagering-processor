@@ -9,14 +9,21 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
 
 ## Status
 
-**Em construção.** Neste momento o repositório contém a fundação do projeto (ferramentas e
-configuração), o bootstrap mínimo do NestJS com `GET /health/live` e a infraestrutura de
-persistência: PostgreSQL via Docker Compose, MikroORM integrado ao NestJS e o mecanismo de
-migrations. Também há a infraestrutura inicial de mensageria: SQS FIFO local (ElasticMQ), com
-provisionamento da fila `wager-events.fifo` e de sua DLQ. Ainda **não há** entidades, schema de
-negócio, migrations, código de domínio, publicação ou consumo de mensagens nem `GET /health/ready`.
-Esta seção será atualizada a cada etapa concluída; nada será descrito como pronto antes de estar
-implementado e verificado.
+**Em construção.** Neste momento o repositório contém:
+
+- a fundação do projeto, o bootstrap do NestJS e `GET /health/live`;
+- PostgreSQL via Docker Compose, MikroORM e o schema financeiro (wallets, transações e ledger
+  imutável), com constraints no banco e migration versionada;
+- o domínio (`Money`, `Wallet`, `WagerTransaction`, ledger, reversões e reconciliação), sem
+  dependência de framework;
+- `POST /wallets`: abertura atômica de wallet (com a transação interna `OPENING` e o lançamento de
+  crédito quando o saldo inicial é positivo);
+- SQS FIFO local (ElasticMQ), com provisionamento da fila `wager-events.fifo` e de sua DLQ.
+
+Ainda **não há** submissão ou processamento de transações, idempotência, Inbox/Outbox, publicação ou
+consumo de mensagens, consultas da API, autenticação (só o ponto de extensão) nem `GET /health/ready`.
+Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md). Esta seção é atualizada a cada
+etapa concluída; nada é descrito como pronto antes de estar implementado e verificado.
 
 ## Stack alvo
 

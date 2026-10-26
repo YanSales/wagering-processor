@@ -1,10 +1,12 @@
 import { type EntityManager, UniqueConstraintViolationException } from '@mikro-orm/core';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import {
+  AmountOutOfStorageRangeError,
   type OpenedWallet,
   WalletAlreadyExistsError,
   type WalletRepository,
 } from '../../application/wallet-repository';
+import type { Money } from '../../domain/money';
 import type { WagerTransaction } from '../../domain/wager-transaction';
 import type { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
@@ -12,6 +14,10 @@ import { WagerTransactionRecord } from '../schema/wager-transaction.schema';
 import { WalletRecord } from '../schema/wallet.schema';
 
 const WALLET_PLAYER_CURRENCY_UNIQUE = 'wallets_player_id_currency_unique';
+
+/** Faixa das colunas `bigint` (inteiro de 64 bits com sinal) do PostgreSQL, em centavos. */
+export const PG_BIGINT_MIN = -9_223_372_036_854_775_808n;
+export const PG_BIGINT_MAX = 9_223_372_036_854_775_807n;
 
 /**
  * `WalletRepository` sobre MikroORM/PostgreSQL. Converte objetos de domínio em linhas de
@@ -21,6 +27,14 @@ export class MikroOrmWalletRepository implements WalletRepository {
   constructor(private readonly orm: MikroORM) {}
 
   async insertOpened({ wallet, opening, openingEntry }: OpenedWallet): Promise<void> {
+    // Antes da transação: um valor fora da faixa não chega ao banco (que o recusaria com erro genérico).
+    assertStorable(wallet.balance);
+    if (opening !== null) assertStorable(opening.money);
+    if (openingEntry !== null) {
+      assertStorable(openingEntry.money);
+      assertStorable(openingEntry.balanceBefore);
+      assertStorable(openingEntry.balanceAfter);
+    }
     try {
       // Um fork por operação: a unidade de trabalho não é compartilhada entre chamadas.
       await this.orm.em.fork().transactional(async (em) => {
@@ -43,6 +57,12 @@ export class MikroOrmWalletRepository implements WalletRepository {
       }
       throw error;
     }
+  }
+}
+
+function assertStorable(money: Money): void {
+  if (money.cents < PG_BIGINT_MIN || money.cents > PG_BIGINT_MAX) {
+    throw new AmountOutOfStorageRangeError(money, PG_BIGINT_MIN, PG_BIGINT_MAX);
   }
 }
 
