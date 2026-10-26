@@ -91,11 +91,13 @@ async function insertTransaction(row: TransactionRow) {
   const submission = row.submission ?? kind !== 'OPENING';
   const ext = row.externalTransactionId ?? `ext-${id}`;
   const concluded = kind !== 'OPENING' && (status === 'PROCESSED' || status === 'REJECTED');
+  // Aguardar a referência exige a próxima tentativa agendada (`pending_reference_schedule_check`).
+  const nextReferenceAttemptAt = status === 'PENDING_REFERENCE' ? new Date() : null;
   await sql(
     `insert into wager_transactions (id, wallet_id, player_id, kind, status, provider_id, external_transaction_id,
        idempotency_key, payload_hash, round_id, game_id, money_cents, currency, reference_external_transaction_id,
-       reference_transaction_id, failure_code, result_balance_cents, created_at)
-       values (?, ?, 'player-x', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())`,
+       reference_transaction_id, failure_code, result_balance_cents, next_reference_attempt_at, created_at)
+       values (?, ?, 'player-x', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())`,
     [
       id,
       row.walletId,
@@ -113,6 +115,7 @@ async function insertTransaction(row: TransactionRow) {
       row.referenceTransactionId ?? null,
       row.failureCode ?? null,
       row.resultBalanceCents === undefined ? (concluded ? '0' : null) : row.resultBalanceCents,
+      nextReferenceAttemptAt,
     ],
   );
   return id;

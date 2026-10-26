@@ -17,6 +17,14 @@ export function assertStorable(money: Money): void {
   }
 }
 
+/** Campos de persistência que o domínio não carrega. */
+export interface TransactionRecordExtras {
+  /** Linha da referência resolvida (o id interno vem de `transaction.referenceTransactionId`). */
+  referenceTransaction?: WagerTransactionRecord | null;
+  /** Próxima tentativa de resolução, somente em `PENDING_REFERENCE` (§7.1). */
+  nextReferenceAttemptAt?: Date | null;
+}
+
 /**
  * Linha de `wager_transactions` a partir do domínio. `resultBalance` é o saldo da wallet observado ao
  * concluir a transação (contrato §7, regra 7); a `OPENING` não o registra.
@@ -25,6 +33,7 @@ export function toTransactionRecord(
   transaction: WagerTransaction,
   wallet: WalletRecord,
   resultBalance: Money | null,
+  extras: TransactionRecordExtras = {},
 ): WagerTransactionRecord {
   return {
     id: transaction.id,
@@ -41,10 +50,13 @@ export function toTransactionRecord(
     moneyCents: transaction.money.cents,
     currency: transaction.money.currency,
     referenceExternalTransactionId: transaction.referenceExternalTransactionId ?? null,
-    // Referências resolvidas entram com as reversões; OPENING e BET não as têm.
-    referenceTransaction: null,
+    // Só uma reversão aplicada aponta para a referência: o índice de reversão única (§7, regra 4)
+    // não pode ser ocupado por uma rejeição.
+    referenceTransaction: extras.referenceTransaction ?? null,
     failureCode: transaction.failureCode ?? null,
     resultBalanceCents: resultBalance === null ? null : resultBalance.cents,
+    referenceAttempts: 0,
+    nextReferenceAttemptAt: extras.nextReferenceAttemptAt ?? null,
     createdAt: transaction.createdAt,
     processedAt: transaction.processedAt ?? null,
   };

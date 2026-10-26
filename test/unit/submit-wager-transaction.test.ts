@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { FailureCodes } from '../../src/application/failure-codes';
+import { ReferenceRetryPolicy } from '../../src/application/reference-retry-policy';
 import {
   DuplicateExternalTransactionError,
   IdempotencyConflictError,
@@ -9,6 +10,8 @@ import {
 } from '../../src/application/submit-wager-transaction';
 import {
   type ExistingSubmissions,
+  type ReferenceQuery,
+  type ResolvedReference,
   type StoredSubmission,
   type SubmissionDecision,
   type SubmissionKeys,
@@ -19,6 +22,7 @@ import {
 import { Money } from '../../src/domain/money';
 import {
   type WagerTransactionKind as Kind,
+  type WagerTransaction,
   WagerTransactionKind,
   WagerTransactionStatus,
 } from '../../src/domain/wager-transaction';
@@ -26,7 +30,7 @@ import { Wallet, type WalletState } from '../../src/domain/wallet';
 import type { WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
 import { brl, T0 } from '../support/wager-fixtures';
 
-const { Processed, Rejected } = WagerTransactionStatus;
+const { Processed, Rejected, PendingReference } = WagerTransactionStatus;
 
 /**
  * Repositório em memória da porta: guarda wallets, submissões e lançamentos. Não simula a
@@ -36,7 +40,26 @@ class InMemoryWagerTransactionRepository implements WagerTransactionRepository {
   readonly wallets = new Map<string, WalletState>();
   readonly submissions: StoredSubmission[] = [];
   readonly entries: WalletLedgerEntry[] = [];
+  /** Transações decididas, para resolver referências como o banco faria. */
+  readonly transactions: WagerTransaction[] = [];
+  readonly schedules = new Map<string, Date>();
   decideCalls = 0;
+
+  resolve(query: ReferenceQuery): ResolvedReference | null {
+    const reference = this.transactions.find(
+      (t) =>
+        t.providerId === query.providerId &&
+        t.externalTransactionId === query.externalTransactionId,
+    );
+    if (reference === undefined) return null;
+    const alreadyReversed = this.transactions.some(
+      (t) =>
+        t.referenceTransactionId === reference.id &&
+        t.kind === query.reversalKind &&
+        t.status === WagerTransactionStatus.Processed,
+    );
+    return { transaction: reference, alreadyReversed };
+  }
 
   addWallet(cents: bigint, currency = 'BRL', playerId = 'player-1', id = 'wallet-1') {
     this.wallets.set(id, {
@@ -65,7 +88,8 @@ class InMemoryWagerTransactionRepository implements WagerTransactionRepository {
   async applyToLockedWallet(
     walletId: string,
     keys: SubmissionKeys,
-    decide: (wallet: Wallet) => SubmissionDecision,
+    decide: (wallet: Wallet, reference: ResolvedReference | null) => SubmissionDecision,
+    query?: ReferenceQuery,
   ): Promise<SubmissionOutcome> {
     const state = this.wallets.get(walletId);
     if (state === undefined) throw new WalletNotFoundError(walletId);
@@ -74,7 +98,12 @@ class InMemoryWagerTransactionRepository implements WagerTransactionRepository {
       return { kind: 'EXISTING', existing };
     }
     this.decideCalls += 1;
-    const { transaction, wallet, ledgerEntry } = decide(Wallet.rehydrate(state));
+    const decision = decide(Wallet.rehydrate(state), query ? this.resolve(query) : null);
+    const { transaction, wallet, ledgerEntry } = decision;
+    this.transactions.push(transaction);
+    if (decision.nextReferenceAttemptAt !== undefined) {
+      this.schedules.set(transaction.id, decision.nextReferenceAttemptAt);
+    }
     const submission: StoredSubmission = {
       transactionId: transaction.id,
       idempotencyKey: keys.idempotencyKey,
@@ -386,11 +415,121 @@ describe('SubmitWagerTransaction: LOSS sem referência', () => {
   });
 });
 
+describe('SubmitWagerTransaction: REFUND', () => {
+  const refundOf = (betTx: string, overrides: Partial<SubmitWagerTransactionCommand> = {}) =>
+    bet({
+      idempotencyKey: `provider-a:refund-of-${betTx}`,
+      externalTransactionId: `refund-of-${betTx}`,
+      kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: betTx,
+      ...overrides,
+    });
+
+  test('BET ainda ausente: PENDING_REFERENCE, saldo intacto, sem lançamento, tentativa em T0 + 2 s', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+
+    const result = await useCase.execute(refundOf('tx-1'));
+
+    expect(result).toMatchObject({ status: PendingReference, idempotentReplay: false });
+    expect(result.balance.cents).toBe(10_000n);
+    expect(repository.entries).toEqual([]);
+    expect(repository.wallets.get('wallet-1')?.version).toBe(1);
+    expect(repository.schedules.get(result.transactionId)?.getTime()).toBe(T0.getTime() + 2_000);
+  });
+
+  test('BET já aplicada: crédito de igual valor, PROCESSED com o id interno da BET', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+    const placed = await useCase.execute(bet());
+
+    const result = await useCase.execute(refundOf('tx-1'));
+
+    expect(result).toMatchObject({ status: Processed, failureCode: undefined });
+    expect(result.balance.cents).toBe(10_000n);
+    expect(repository.entries.map((e) => e.direction)).toEqual(['DEBIT', 'CREDIT']);
+    const refund = repository.transactions.find((t) => t.id === result.transactionId);
+    expect(refund?.referenceTransactionId).toBe(placed.transactionId);
+    expect(repository.schedules.has(result.transactionId)).toBe(false);
+  });
+
+  test('referência existente e incompatível: REJECTED de imediato, sem agendamento', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+    await useCase.execute(bet());
+
+    const result = await useCase.execute(refundOf('tx-1', { roundId: 'round-2' }));
+
+    expect(result).toMatchObject({
+      status: Rejected,
+      failureCode: FailureCodes.ReferenceMismatch,
+    });
+    expect(result.balance.cents).toBe(2_000n);
+    expect(repository.entries).toHaveLength(1);
+    expect(repository.schedules.size).toBe(0);
+  });
+
+  test('segundo REFUND da mesma BET: REJECTED REFERENCE_ALREADY_REVERSED (§7, regra 4)', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+    await useCase.execute(bet());
+    await useCase.execute(refundOf('tx-1'));
+
+    const second = await useCase.execute(
+      refundOf('tx-1', { idempotencyKey: 'provider-a:r2', externalTransactionId: 'r2' }),
+    );
+
+    expect(second).toMatchObject({
+      status: Rejected,
+      failureCode: FailureCodes.ReferenceAlreadyReversed,
+    });
+    expect(repository.entries).toHaveLength(2);
+  });
+
+  test('moeda diferente da wallet: REJECTED CURRENCY_MISMATCH sem esperar a referência', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+
+    const result = await useCase.execute(
+      refundOf('tx-1', { money: Money.fromCents(8_000n, 'USD') }),
+    );
+
+    expect(result).toMatchObject({ status: Rejected, failureCode: FailureCodes.CurrencyMismatch });
+    expect(repository.schedules.size).toBe(0);
+  });
+
+  test('replay de um REFUND pendente: o mesmo resultado, sem nova decisão', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+    const first = await useCase.execute(refundOf('tx-1'));
+
+    const replay = await useCase.execute(refundOf('tx-1'));
+
+    expect(replay).toEqual({ ...first, idempotentReplay: true });
+    expect(repository.decideCalls).toBe(1);
+  });
+
+  test('a política de tentativas injetada define o primeiro agendamento', async () => {
+    const repository = new InMemoryWagerTransactionRepository();
+    repository.addWallet(10_000n);
+    const useCase = new SubmitWagerTransaction(
+      repository,
+      () => T0,
+      () => 'id-1',
+      ReferenceRetryPolicy.from({ maxAttempts: 1, baseDelayMs: 50, maxDelayMs: 50 }),
+    );
+
+    await useCase.execute(refundOf('tx-1'));
+
+    expect(repository.schedules.get('id-1')?.getTime()).toBe(T0.getTime() + 50);
+  });
+});
+
 describe('SubmitWagerTransaction: submissões recusadas sem gravar', () => {
   test.each([
     ['OPENING (interno)', bet({ kind: WagerTransactionKind.Opening })],
     [
-      'WIN com referência (PENDING_REFERENCE e §7.1 ainda não existem)',
+      'WIN com referência (BET referenciada não PROCESSED sem regra definida)',
       bet({ kind: WagerTransactionKind.Win, referenceExternalTransactionId: 'tx-0' }),
     ],
     [
@@ -402,8 +541,12 @@ describe('SubmitWagerTransaction: submissões recusadas sem gravar', () => {
       bet({ kind: WagerTransactionKind.Loss, referenceExternalTransactionId: 'tx-0' }),
     ],
     [
-      'REFUND (fora desta etapa)',
-      bet({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'tx-0' }),
+      'REFUND de valor zero (regra não definida)',
+      bet({
+        kind: WagerTransactionKind.Refund,
+        referenceExternalTransactionId: 'tx-0',
+        money: brl(0n),
+      }),
     ],
     [
       'ROLLBACK (fora desta etapa)',

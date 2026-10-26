@@ -18,16 +18,19 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
   dependência de framework;
 - `POST /wallets`: abertura atômica de wallet (com a transação interna `OPENING` e o lançamento de
   crédito quando o saldo inicial é positivo);
-- `POST /wagering/transactions` para `BET`, `WIN` e `LOSS` sem referência (header `Idempotency-Key`
-  obrigatório), pelo caso de uso
-  `SubmitWagerTransaction`: débito (BET) ou crédito (WIN) com lançamento, ou só o registro (LOSS),
-  e o resultado na mesma transação SQL, lock por wallet
+- `POST /wagering/transactions` para `BET`, `WIN` e `LOSS` sem referência e `REFUND` (header
+  `Idempotency-Key` obrigatório), pelo caso de uso
+  `SubmitWagerTransaction`: débito (BET) ou crédito (WIN, REFUND) com lançamento, ou só o registro
+  (LOSS), e o resultado na mesma transação SQL, lock por wallet
   no PostgreSQL e idempotência persistente;
+- REFUND que chega antes da BET: gravado em `PENDING_REFERENCE` (HTTP 202) e resolvido pelo worker
+  agendado de cada instância, com backoff exponencial e limite de tentativas (§7.1); esgotado o
+  limite, `REJECTED` com `REFERENCE_NOT_FOUND`;
 - SQS FIFO local (ElasticMQ), com provisionamento da fila `wager-events.fifo` e de sua DLQ.
 
-Ainda **não há** processamento de WIN e LOSS com referência, REFUND e ROLLBACK (a API responde 501),
-Inbox/Outbox, publicação ou consumo de mensagens, consultas da API, autenticação (só o ponto de
-extensão) nem `GET /health/ready`.
+Ainda **não há** processamento de WIN e LOSS com referência e ROLLBACK (a API responde 501),
+eventos de integração, Inbox/Outbox, publicação ou consumo de mensagens, consultas da API,
+autenticação (só o ponto de extensão) nem `GET /health/ready`.
 Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md). Esta seção é atualizada a cada
 etapa concluída; nada é descrito como pronto antes de estar implementado e verificado.
 
@@ -97,6 +100,23 @@ bun run migration:list       # migrations executadas
 bun run migration:pending    # migrations pendentes
 bun run migration:check      # verifica se o schema mapeado exige nova migration
 ```
+
+## Worker de referências pendentes (`PENDING_REFERENCE`)
+
+Roda dentro de cada instância da API; o estado fica no PostgreSQL. Variáveis opcionais (valores
+inválidos impedem a inicialização):
+
+| Variável                             | Padrão   | Uso                                                      |
+| ------------------------------------ | -------- | -------------------------------------------------------- |
+| `PENDING_REFERENCE_WORKER_ENABLED`   | `true`   | `false` desliga o agendamento nesta instância            |
+| `PENDING_REFERENCE_POLL_INTERVAL_MS` | `1000`   | Intervalo entre o fim de uma rodada e a próxima          |
+| `PENDING_REFERENCE_BATCH_SIZE`       | `50`     | Máximo de transações por rodada                          |
+| `PENDING_REFERENCE_MAX_ATTEMPTS`     | `10`     | Tentativas antes de `REJECTED` com `REFERENCE_NOT_FOUND` |
+| `PENDING_REFERENCE_BASE_DELAY_MS`    | `2000`   | Espera até a primeira tentativa; dobra a cada tentativa  |
+| `PENDING_REFERENCE_MAX_DELAY_MS`     | `300000` | Teto da espera entre tentativas                          |
+
+Com os padrões, a rejeição por referência inexistente ocorre cerca de 18,5 min após a submissão.
+Política e garantias: `ARCHITECTURE.md`, seção "Referências fora de ordem".
 
 ## Mensageria (SQS)
 

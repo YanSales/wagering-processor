@@ -50,7 +50,7 @@ interface StatusSetter {
  * financeira e a idempotência são do caso de uso e do PostgreSQL.
  *
  * Resultado de negócio gravado (corpo `SubmissionResponse`): `PROCESSED` → 200, `REJECTED` → 422,
- * inclusive em replay. Erros de requisição (corpo `{ statusCode, error, message, code }`): 400
+ * `PENDING_REFERENCE` → 202, inclusive em replay. Erros de requisição (corpo `{ statusCode, error, message, code }`): 400
  * payload inválido, 404 wallet inexistente, 409 conflito de idempotência ou operação externa
  * duplicada, 501 submissão ainda não suportada, 503 falha transitória. Outros erros: 500 genérico.
  * Sujeito ao `AuthGuard` global (autenticação ainda não implementada, ver `ARCHITECTURE.md`).
@@ -84,14 +84,20 @@ export class WageringTransactionsController {
     } catch (error) {
       throw toRequestError(error);
     }
-    // Rejeição de negócio é um resultado gravado, não erro de requisição: corpo do resultado, 422.
-    response.status(
-      result.status === WagerTransactionStatus.Rejected
-        ? HttpStatus.UNPROCESSABLE_ENTITY
-        : HttpStatus.OK,
-    );
+    response.status(statusFor(result.status));
     return toSubmissionResponse(result);
   }
+}
+
+/**
+ * Rejeição de negócio é um resultado gravado, não erro de requisição: corpo do resultado, 422. A
+ * transação aguardando a referência foi aceita e gravada, mas ainda não aplicada: 202 (§9, "aceite
+ * com processamento pendente"); o reenvio devolve o estado atual.
+ */
+function statusFor(status: WagerTransactionStatus): HttpStatus {
+  if (status === WagerTransactionStatus.Rejected) return HttpStatus.UNPROCESSABLE_ENTITY;
+  if (status === WagerTransactionStatus.PendingReference) return HttpStatus.ACCEPTED;
+  return HttpStatus.OK;
 }
 
 /** Erros conhecidos do caso de uso → HTTP; os demais seguem para o 500 genérico do Nest. */

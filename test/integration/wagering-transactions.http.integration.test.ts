@@ -9,7 +9,14 @@ import {
   TransientPersistenceError,
   type WagerTransactionRepository,
 } from '../../src/application/wager-transaction-repository';
-import { WAGER_TRANSACTION_REPOSITORY } from '../../src/wagering/wagering.module';
+import {
+  type PendingReferenceSettings,
+  readPendingReferenceSettings,
+} from '../../src/wagering/pending-reference.config';
+import {
+  PENDING_REFERENCE_SETTINGS,
+  WAGER_TRANSACTION_REPOSITORY,
+} from '../../src/wagering/wagering.module';
 import { assertTestDatabaseEnv, DATABASE_BOOTSTRAP_TIMEOUT_MS } from '../support/test-database';
 
 // O AppModule conecta ao PostgreSQL e o endpoint grava: só roda contra o banco de teste.
@@ -20,11 +27,21 @@ interface Wallet {
   playerId: string;
 }
 
-async function startApp(repository?: WagerTransactionRepository) {
+/**
+ * Worker de `PENDING_REFERENCE` desligado por padrão: as pendências só mudam quando o teste quer. O
+ * teste do agendamento liga o worker com intervalos curtos.
+ */
+async function startApp(
+  repository?: WagerTransactionRepository,
+  pendingReference: Partial<PendingReferenceSettings> = { enabled: false },
+) {
   const builder = Test.createTestingModule({ imports: [AppModule] });
   if (repository !== undefined) {
     builder.overrideProvider(WAGER_TRANSACTION_REPOSITORY).useValue(repository);
   }
+  builder
+    .overrideProvider(PENDING_REFERENCE_SETTINGS)
+    .useValue({ ...readPendingReferenceSettings({}), ...pendingReference });
   const app = (await builder.compile()).createNestApplication({ logger: false });
   await app.listen(0, '127.0.0.1');
   return { app, baseUrl: await app.getUrl() };
@@ -539,7 +556,14 @@ describe('POST /wagering/transactions: requisições recusadas sem efeito', () =
     ['WIN com referência', { kind: 'WIN', referenceExternalTransactionId: 'tx-0' }],
     ['WIN de valor zero', { kind: 'WIN', money: { amount: '0.00', currency: 'BRL' } }],
     ['LOSS com referência', { kind: 'LOSS', referenceExternalTransactionId: 'tx-0' }],
-    ['REFUND', { kind: 'REFUND', referenceExternalTransactionId: 'tx-0' }],
+    [
+      'REFUND de valor zero',
+      {
+        kind: 'REFUND',
+        referenceExternalTransactionId: 'tx-0',
+        money: { amount: '0.00', currency: 'BRL' },
+      },
+    ],
     ['ROLLBACK', { kind: 'ROLLBACK', referenceExternalTransactionId: 'tx-0' }],
     ['BET de valor zero', { money: { amount: '0.00', currency: 'BRL' } }],
     ['BET com referência', { referenceExternalTransactionId: 'tx-0' }],
@@ -613,6 +637,166 @@ describe('POST /wagering/transactions: falhas da persistência', () => {
     expect(text).not.toContain('segredo');
     expect(text).not.toContain('insert into');
   });
+});
+
+describe('POST /wagering/transactions: REFUND e PENDING_REFERENCE', () => {
+  /** REFUND da BET `bet`: mesma rodada, valor e player, operação externa nova. */
+  function refundBody(wallet: Wallet, bet: { externalTransactionId: string }, amount: string) {
+    return betBody(wallet, amount, {
+      kind: 'REFUND',
+      referenceExternalTransactionId: bet.externalTransactionId,
+    });
+  }
+
+  async function refundState(key: string) {
+    const [row] = await sql<{
+      status: string;
+      failure_code: string | null;
+      attempts: number;
+      scheduled: boolean;
+      reference_id: string | null;
+      entries: number;
+    }>(
+      `select t.status, t.failure_code, t.reference_attempts as attempts,
+              t.next_reference_attempt_at is not null as scheduled,
+              t.reference_transaction_id as reference_id,
+              (select count(*) from wallet_ledger_entries e where e.transaction_id = t.id)::int as entries
+         from wager_transactions t where t.idempotency_key = ?`,
+      [key],
+    );
+    return row;
+  }
+
+  test('REFUND antes da BET: 202 PENDING_REFERENCE, sem crédito nem lançamento; reenvio 202', async () => {
+    const wallet = await openWallet('100.00');
+    const bet = betBody(wallet, '30.00');
+    const refund = refundBody(wallet, bet, '30.00');
+
+    const response = await submit(refund, keyOf(refund));
+
+    expect(response.status).toBe(202);
+    expect(await json(response)).toEqual({
+      transactionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      status: 'PENDING_REFERENCE',
+      balance: { amount: '100.00', currency: 'BRL' },
+      idempotentReplay: false,
+    });
+    expect(await refundState(keyOf(refund))).toEqual({
+      status: 'PENDING_REFERENCE',
+      failure_code: null,
+      attempts: 0,
+      scheduled: true,
+      reference_id: null,
+      entries: 0,
+    });
+    expect(await walletState(wallet.id)).toMatchObject({ balance: '10000', version: 1 });
+
+    const replay = await submit(refund, keyOf(refund));
+    expect(replay.status).toBe(202);
+    expect(await json(replay)).toMatchObject({
+      status: 'PENDING_REFERENCE',
+      idempotentReplay: true,
+    });
+  });
+
+  test('REFUND depois da BET: 200 PROCESSED, crédito com um lançamento e referência gravada', async () => {
+    const wallet = await openWallet('100.00');
+    const bet = betBody(wallet, '30.00');
+    expect((await submit(bet, keyOf(bet))).status).toBe(200);
+    const refund = refundBody(wallet, bet, '30.00');
+
+    const response = await submit(refund, keyOf(refund));
+
+    expect(response.status).toBe(200);
+    expect(await json(response)).toMatchObject({
+      status: 'PROCESSED',
+      balance: { amount: '100.00', currency: 'BRL' },
+    });
+    const [betRow] = await transactionsWithKey(keyOf(bet));
+    expect(await refundState(keyOf(refund))).toMatchObject({
+      status: 'PROCESSED',
+      reference_id: betRow?.id,
+      scheduled: false,
+      entries: 1,
+    });
+    expect(await walletState(wallet.id)).toMatchObject({
+      balance: '10000',
+      rebuilt: '10000',
+      version: 3,
+    });
+  });
+
+  test.each([
+    ['outra rodada', { roundId: 'round-outro' }, '30.00', 'REFERENCE_MISMATCH'],
+    ['valor diferente', {}, '29.99', 'REFERENCE_AMOUNT_MISMATCH'],
+  ])(
+    'referência existente e incompatível (%s): 422 imediato, sem lançamento',
+    async (_case, overrides, amount, code) => {
+      const wallet = await openWallet('100.00');
+      const bet = betBody(wallet, '30.00');
+      expect((await submit(bet, keyOf(bet))).status).toBe(200);
+      const refund = { ...refundBody(wallet, bet, amount), ...overrides };
+
+      const response = await submit(refund, keyOf(refund));
+
+      expect(response.status).toBe(422);
+      expect(await json(response)).toMatchObject({ status: 'REJECTED', failureCode: code });
+      expect(await refundState(keyOf(refund))).toMatchObject({ entries: 0, scheduled: false });
+      expect(await walletState(wallet.id)).toMatchObject({ balance: '7000', version: 2 });
+    },
+  );
+
+  test('segundo REFUND da mesma BET: 422 REFERENCE_ALREADY_REVERSED, um único crédito', async () => {
+    const wallet = await openWallet('100.00');
+    const bet = betBody(wallet, '30.00');
+    expect((await submit(bet, keyOf(bet))).status).toBe(200);
+    const first = refundBody(wallet, bet, '30.00');
+    const second = refundBody(wallet, bet, '30.00');
+
+    expect((await submit(first, keyOf(first))).status).toBe(200);
+    const response = await submit(second, keyOf(second));
+
+    expect(response.status).toBe(422);
+    expect(await json(response)).toMatchObject({ failureCode: 'REFERENCE_ALREADY_REVERSED' });
+    expect(await walletState(wallet.id)).toMatchObject({ balance: '10000', version: 3 });
+  });
+
+  test(
+    'worker agendado da aplicação resolve a pendência sozinho; o reenvio passa a 200',
+    async () => {
+      const withWorker = await startApp(undefined, {
+        enabled: true,
+        pollIntervalMs: 20,
+        retry: { maxAttempts: 10, baseDelayMs: 10, maxDelayMs: 50 },
+      });
+      try {
+        const wallet = await openWallet('100.00');
+        const bet = betBody(wallet, '30.00');
+        const refund = refundBody(wallet, bet, '30.00');
+        expect((await submit(refund, keyOf(refund), withWorker.baseUrl)).status).toBe(202);
+        expect((await submit(bet, keyOf(bet), withWorker.baseUrl)).status).toBe(200);
+
+        let state = await refundState(keyOf(refund));
+        for (let i = 0; i < 250 && state?.status === 'PENDING_REFERENCE'; i++) {
+          await Bun.sleep(20);
+          state = await refundState(keyOf(refund));
+        }
+
+        expect(state).toMatchObject({ status: 'PROCESSED', entries: 1, scheduled: false });
+        const replay = await submit(refund, keyOf(refund), withWorker.baseUrl);
+        expect(replay.status).toBe(200);
+        expect(await json(replay)).toMatchObject({
+          status: 'PROCESSED',
+          balance: { amount: '100.00', currency: 'BRL' },
+          idempotentReplay: true,
+        });
+        expect(await walletState(wallet.id)).toMatchObject({ balance: '10000', rebuilt: '10000' });
+      } finally {
+        await withWorker.app.close();
+      }
+    },
+    DATABASE_BOOTSTRAP_TIMEOUT_MS,
+  );
 });
 
 describe('autenticação: estado atual', () => {

@@ -27,6 +27,10 @@ export class WagerTransactionRecord {
    * (contrato §7, regra 7), inclusive de uma rejeição, que não tem lançamento. `null` na `OPENING`.
    */
   resultBalanceCents!: bigint | null;
+  /** Tentativas de resolução feitas pelo worker de referências pendentes (§7.1). */
+  referenceAttempts!: number;
+  /** Próxima tentativa de resolução; preenchida somente em `PENDING_REFERENCE`. */
+  nextReferenceAttemptAt!: Date | null;
   createdAt!: Date;
   processedAt!: Date | null;
 }
@@ -56,6 +60,8 @@ const SUBMISSION_COLUMNS = [
  * persistida como REJECTED (auditável). O `failureCode` só tem o formato validado no banco; os
  * códigos usados estão em `src/application/failure-codes.ts`.
  * - submissão concluída (`PROCESSED`/`REJECTED`) guarda o saldo observado, não negativo.
+ * - `PENDING_REFERENCE` (§7, regra 8) existe somente com referência externa e próxima tentativa
+ *   agendada; nenhum outro estado tem tentativa agendada. O índice parcial atende a busca do worker.
  */
 export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
   class: WagerTransactionRecord,
@@ -91,6 +97,8 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     },
     failureCode: { type: 'text', nullable: true },
     resultBalanceCents: { type: new BigIntType('bigint'), nullable: true },
+    referenceAttempts: { type: 'integer', default: 0 },
+    nextReferenceAttemptAt: { type: 'timestamptz', nullable: true },
     createdAt: { type: 'timestamptz' },
     processedAt: { type: 'timestamptz', nullable: true },
   },
@@ -139,6 +147,25 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
       name: 'wager_transactions_result_balance_required_check',
       expression:
         "kind = 'OPENING' or status not in ('PROCESSED', 'REJECTED') or result_balance_cents is not null",
+    },
+    {
+      name: 'wager_transactions_reference_attempts_check',
+      expression: 'reference_attempts >= 0',
+    },
+    {
+      // Aguardar a referência (§6.3) exige uma referência e uma próxima tentativa (§7.1).
+      name: 'wager_transactions_pending_reference_schedule_check',
+      expression:
+        "(status = 'PENDING_REFERENCE' and next_reference_attempt_at is not null " +
+        'and reference_external_transaction_id is not null) or ' +
+        "(status <> 'PENDING_REFERENCE' and next_reference_attempt_at is null)",
+    },
+  ],
+  indexes: [
+    {
+      name: 'wager_transactions_pending_reference_due_index',
+      properties: ['nextReferenceAttemptAt'],
+      where: "status = 'PENDING_REFERENCE'",
     },
   ],
 });

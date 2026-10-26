@@ -93,6 +93,18 @@ describe('WageringTransactionsController.submit', () => {
     expect(body).toMatchObject({ status: 'REJECTED', failureCode: 'INSUFFICIENT_FUNDS' });
   });
 
+  test('PENDING_REFERENCE: 202, aceito e gravado, ainda não aplicado', async () => {
+    const { controller, statuses, response } = setup(
+      result(WagerTransactionStatus.PendingReference),
+    );
+
+    const body = await controller.submit(KEY, BODY, response);
+
+    expect(statuses).toEqual([202]);
+    expect(body).toMatchObject({ status: 'PENDING_REFERENCE' });
+    expect(body).not.toHaveProperty('failureCode');
+  });
+
   test.each([
     ['sem Idempotency-Key', undefined, BODY],
     ['money inválido', KEY, { ...BODY, money: { amount: '25', currency: 'BRL' } }],

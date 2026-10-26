@@ -26,9 +26,8 @@ export interface WinInput {
  * - `CurrencyMismatchError`: moeda do prêmio diferente da moeda da wallet (de `Wallet.credit`).
  * Converter esses erros em `REJECTED` com `failureCode` (§7.2) cabe ao processamento.
  *
- * WIN com referência é recusado: o contrato permite referenciar a BET da rodada (§7), mas a
- * referência ausente exige `PENDING_REFERENCE` com worker (§7.1), ainda inexistente, e não define
- * o caso de uma BET referenciada que não esteja `PROCESSED`. Valor zero também fica fora
+ * WIN com referência é recusado: o contrato permite referenciar a BET da rodada (§7), mas não
+ * define o caso de uma BET referenciada que não esteja `PROCESSED`. Valor zero também fica fora
  * (`Wallet.credit` exige valor positivo; a regra de negócio não foi definida).
  */
 export function applyWin(input: WinInput): WalletLedgerEntry {

@@ -168,6 +168,23 @@
           "enumItems": [],
           "mappedType": "bigint"
         },
+        "next_reference_attempt_at": {
+          "name": "next_reference_attempt_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
         "payload_hash": {
           "name": "payload_hash",
           "type": "text",
@@ -235,6 +252,23 @@
           "collation": null,
           "enumItems": [],
           "mappedType": "text"
+        },
+        "reference_attempts": {
+          "name": "reference_attempts",
+          "type": "int",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "0",
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "integer"
         },
         "reference_external_transaction_id": {
           "name": "reference_external_transaction_id",
@@ -369,6 +403,17 @@
         },
         {
           "columnNames": [
+            "next_reference_attempt_at"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "wager_transactions_pending_reference_due_index",
+          "primary": false,
+          "unique": false,
+          "where": "status = 'PENDING_REFERENCE'"
+        },
+        {
+          "columnNames": [
             "id"
           ],
           "composite": false,
@@ -422,6 +467,16 @@
           "name": "wager_transactions_money_cents_check",
           "expression": "money_cents >= 0",
           "definition": "check (money_cents >= 0)"
+        },
+        {
+          "name": "wager_transactions_pending_reference_schedule_check",
+          "expression": "(status = 'PENDING_REFERENCE' and next_reference_attempt_at is not null and reference_external_transaction_id is not null) or (status <> 'PENDING_REFERENCE' and next_reference_attempt_at is null)",
+          "definition": "check ((status = 'PENDING_REFERENCE' and next_reference_attempt_at is not null and reference_external_transaction_id is not null) or (status <> 'PENDING_REFERENCE' and next_reference_attempt_at is null))"
+        },
+        {
+          "name": "wager_transactions_reference_attempts_check",
+          "expression": "reference_attempts >= 0",
+          "definition": "check (reference_attempts >= 0)"
         },
         {
           "name": "wager_transactions_reference_required_check",

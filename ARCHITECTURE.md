@@ -191,15 +191,16 @@ contra o mesmo PostgreSQL, que é quem garante a serialização.
 
 ### Pendente
 
-- Aplicar a mesma estratégia às reversões (REFUND, ROLLBACK) e ao WIN com referência quando forem
-  implementados, reutilizando `applyToLockedWallet`.
+- Aplicar a mesma estratégia ao ROLLBACK e ao WIN com referência quando forem implementados,
+  reutilizando `applyToLockedWallet` e `resolvePendingReference` (o REFUND e o worker de
+  `PENDING_REFERENCE` já os usam, seção "Referências fora de ordem").
 - Timeout de espera pelo lock (`lock_timeout`) não está configurado: uma transação presa seguraria
   as operações daquela wallet até o timeout de conexão ou o fim da transação.
 
-## Processamento de BET, WIN e LOSS, e idempotência (contrato §7 e §9)
+## Processamento de BET, WIN, LOSS e REFUND, e idempotência (contrato §7 e §9)
 
 Caso de uso `SubmitWagerTransaction` (`src/application/submit-wager-transaction.ts`). Nesta etapa
-processa `BET`, `WIN` e `LOSS`, todos sem referência, pelo mesmo fluxo (a regra de domínio é
+processa `BET`, `WIN` e `LOSS` sem referência e `REFUND`, pelo mesmo fluxo (a regra de domínio é
 escolhida pelo tipo). Exposto por `POST /wagering/transactions` (seção seguinte); não há consumidor
 SQS.
 
@@ -212,13 +213,11 @@ SQS.
   `assertMovementPreconditions`.
 - **WIN com referência: não processado** (`UnsupportedSubmissionError`, HTTP 501). O contrato diz
   que o WIN "pode referenciar a BET da mesma rodada" (§7), com a referência do mesmo provider,
-  player, wallet, moeda e rodada (regra 2). Mas: referência ausente exige `PENDING_REFERENCE` com
-  worker agendado e limite de tentativas (regra 8 e §7.1), que ainda não existem; e o contrato não
-  define o que fazer se a BET referenciada existir sem estar `PROCESSED` (a exigência de `PROCESSED`
-  está escrita só para REFUND e ROLLBACK). Implementar só o caso "referência presente e válida"
-  deixaria o comportamento dependente da ordem de chegada (§3), por isso nada com referência é
-  aceito por enquanto. O contrato também não limita o número de WINs por rodada ou por BET; nenhuma
-  restrição foi criada.
+  player, wallet, moeda e rodada (regra 2). O `PENDING_REFERENCE` e o worker (regra 8 e §7.1) já
+  existem (usados pelo REFUND), mas o contrato não define o que fazer se a BET referenciada existir
+  sem estar `PROCESSED` (a exigência de `PROCESSED` está escrita só para REFUND e ROLLBACK), por isso
+  WIN com referência continua recusado. O contrato também não limita o número de WINs por rodada ou
+  por BET; nenhuma restrição foi criada.
 - **LOSS sem referência** (domínio, `applyLoss`): §7 tabela, "registra o resultado sem mover saldo",
   sem efeito no saldo e sem lançamento (§6.4); `affectsBalance()` é `false` (§6.3); um LOSS aplicado
   é `PROCESSED` (§11: `WagerTransactionProcessed` vale para "qualquer transação aplicada, inclusive
@@ -229,8 +228,8 @@ SQS.
     valor maior ou igual a zero não altera o saldo; sem movimentação, nenhuma invariante é afetada.
   - **LOSS com referência: não processado** (HTTP 501). O contrato não diz se LOSS pode ter
     referência nem o que ela referenciaria (a regra 1 só a exige em REFUND/ROLLBACK; a tabela só a
-    menciona para WIN), e a referência ausente dependeria de `PENDING_REFERENCE` e do worker (§7.1).
-    O domínio já recusava referência em LOSS (`validateReference`, `UnsupportedReferenceError`).
+    menciona para WIN). O domínio já recusava referência em LOSS (`validateReference`,
+    `UnsupportedReferenceError`).
   - **Concorrência**: o LOSS usa o mesmo `applyToLockedWallet`, com o lock da wallet, embora não a
     altere. O lock faz o saldo observado ser o do ponto de serialização com as BETs e WINs daquela
     wallet e mantém um único caminho de persistência. Limite verificado: nenhum teste demonstra que
@@ -238,11 +237,30 @@ SQS.
     corridas de idempotência continuariam resolvidas pelo `UNIQUE`; com a wallet travada por outra
     transação, o LOSS esperaria de qualquer forma, porque a FK de `wager_transactions` faz o
     PostgreSQL pegar `FOR KEY SHARE` na linha da wallet ao inserir a transação.
+- **REFUND** (domínio, `applyRefund`; decisão compartilhada `decideRefund`, §7 tabela: crédito, 1
+  lançamento `CREDIT`, "reverte uma BET `PROCESSED`, uma única vez"). Sob o lock da wallet, a BET é
+  resolvida por `(providerId, referenceExternalTransactionId)` (regra 2):
+  - wallet de outro player ou moeda diferente da wallet → `REJECTED` (`PLAYER_WALLET_MISMATCH`,
+    `CURRENCY_MISMATCH`), verificados antes da referência;
+  - BET válida (mesmo player, wallet, moeda e rodada; tipo BET; `PROCESSED`; mesmo valor, regras 2,
+    3 e 5) e ainda não reembolsada (regra 4) → crédito, `PROCESSED`, com o id interno da BET em
+    `reference_transaction_id`;
+  - BET existente, mas inválida → `REJECTED` **de imediato**, com o código da violação (decisão
+    aprovada para o projeto: a referência existe e não vai mudar; esperar não a tornaria válida);
+  - BET ausente → `PENDING_REFERENCE` (regra 8), seção seguinte.
+  - Regra 4: a persistência informa, sob o lock, se a BET já tem um REFUND `PROCESSED`; o índice
+    único `wager_transactions_reversal_once_unique` é a garantia final. Só o REFUND aplicado grava
+    `reference_transaction_id`: uma rejeição não ocupa o índice.
+  - Valor `0.00` é recusado (501), como BET e WIN: nunca seria igual ao de uma BET aplicada, e a
+    regra não está definida. A regra 9 (reversão que deixaria saldo negativo) não se aplica a um
+    crédito.
 - **`failureCode`** (§7.2, taxonomia própria, `src/application/failure-codes.ts`):
   `INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `PLAYER_WALLET_MISMATCH` (WIN e LOSS usam os dois
-  últimos).
-  Só os códigos que esta etapa produz; o código de reversão sem saldo (§7, regra 9) e o de
-  referência inexistente (§7.1) entram com essas operações.
+  últimos) e, para referências: `REFERENCE_NOT_FOUND` (esgotado o limite, §7.1),
+  `REFERENCE_MISMATCH` (outro player, wallet, moeda ou rodada, regra 2), `REFERENCE_KIND_NOT_ALLOWED`
+  (regra 3), `REFERENCE_NOT_PROCESSED` (ex.: BET `REJECTED`), `REFERENCE_AMOUNT_MISMATCH` (regra 5) e
+  `REFERENCE_ALREADY_REVERSED` (regra 4). O código de reversão sem saldo (§7, regra 9) entra com o
+  ROLLBACK.
 - **`payloadHash`** (§9): SHA-256 hexadecimal do JSON canônico (chaves ordenadas, sem espaços) de
   `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`,
   `money` (`{ amount, currency }`, 2 casas) e `referenceExternalTransactionId` quando presente. A
@@ -261,8 +279,8 @@ SQS.
   `Migration20261026012348_bet_result_balance`), obrigatória em submissões `PROCESSED`/`REJECTED`
   (`CHECK`) e não negativa. Pré-condição da migration: não existirem submissões concluídas sem esse
   valor; antes desta etapa nenhum código as gravava (só a `OPENING`, isenta).
-- **Recusado sem gravar nada** (regras não definidas pelo contrato ou fora desta etapa): `REFUND`,
-  `ROLLBACK`, BET ou WIN de valor `0.00`, BET, WIN ou LOSS com `referenceExternalTransactionId`
+- **Recusado sem gravar nada** (regras não definidas pelo contrato ou fora desta etapa): `ROLLBACK`,
+  BET, WIN ou REFUND de valor `0.00`, BET, WIN ou LOSS com `referenceExternalTransactionId`
   (`UnsupportedSubmissionError`); wallet inexistente (`WalletNotFoundError`; a FK impede gravar a
   transação).
 - **Limite de armazenamento**: um WIN que levaria o saldo acima do `bigint` (`92233720368547758.07`)
@@ -272,6 +290,119 @@ SQS.
 - **Reutilização**: `POST /wagering/transactions` já chama este caso de uso; o consumidor SQS deverá
   chamar o mesmo `SubmitWagerTransaction`, com a chave de idempotência da mensagem. O consumidor
   ainda precisará da Inbox e do Outbox na mesma transação (§6.5), que não existem.
+
+## Referências fora de ordem: `PENDING_REFERENCE` e o worker agendado (contrato §7.1)
+
+Hoje só o REFUND produz `PENDING_REFERENCE`; o mecanismo não depende do tipo.
+
+**Persistência** (migration `Migration20261026104613_pending_reference_retry`, aditiva e
+reversível): colunas `reference_attempts` (tentativas do worker, `>= 0`) e
+`next_reference_attempt_at`; `CHECK wager_transactions_pending_reference_schedule_check`:
+`PENDING_REFERENCE` exige referência externa e próxima tentativa, e nenhum outro estado tem tentativa
+agendada; índice parcial `wager_transactions_pending_reference_due_index` em
+`next_reference_attempt_at where status = 'PENDING_REFERENCE'` para a busca do worker. A transação
+pendente é gravada inteira (payload, hash, chaves, saldo observado ao aceitar): o reprocessamento não
+depende de memória do processo nem da reentrega do provedor.
+
+- **Pré-condição do `up`:** nenhuma linha em `PENDING_REFERENCE`, porque ela violaria o novo
+  `CHECK`. Antes desta migration, nenhum código produzia esse estado. As colunas novas usam padrão
+  constante (`0`) ou `null` e não reescrevem dados. A validação dos `CHECK`s percorre a tabela sob
+  lock exclusivo; numa tabela grande, valeria `NOT VALID` seguido de `VALIDATE CONSTRAINT`.
+- **O `down` perde dados:** apaga tentativas e agendamentos. Uma linha ainda em `PENDING_REFERENCE`
+  ficaria sem worker, porque a versão anterior não reprocessa. Só reverta sem pendências ou
+  aceitando resolvê-las manualmente.
+
+**Política de tentativas** (`ReferenceRetryPolicy`, decisão aprovada; o §7.1 pede um limite
+"definido e justificado"): 10 tentativas do worker; a primeira 2 s após a submissão, dobrando até o
+teto de 5 min (2, 4, 8, 16, 32, 64, 128, 256, 300 e 300 s). Esgotadas as 10 sem a referência, cerca
+de 18,5 min após a submissão: `REJECTED` com `REFERENCE_NOT_FOUND`, sem lançamento. Justificativa:
+a reentrega fora de ordem de uma fila at-least-once ocorre em segundos ou minutos; uma pendência de
+horas manteria o provedor sem resposta definitiva. Configurável por ambiente (`README.md`); a
+submissão e o worker usam a mesma política.
+
+**Worker** (`ReprocessPendingReferences` + `PendingReferenceWorker`, em toda instância da API):
+
+- rodadas sequenciais, com `PENDING_REFERENCE_POLL_INTERVAL_MS` (padrão 1 s) entre o fim de uma e o
+  início da próxima, e no máximo `PENDING_REFERENCE_BATCH_SIZE` (50) transações vencidas por rodada,
+  das mais antigas para as mais novas. Sem laço sem limite: cada transação é tentada no máximo uma
+  vez por rodada, e só quando vence;
+- cada tentativa é uma transação SQL: trava a wallet (mesma ordem de locks da submissão), relê a
+  transação com `status = 'PENDING_REFERENCE'` e o vencimento, resolve a referência sob o lock e
+  aplica a **mesma** regra da submissão (`decideRefund`); grava a transação (tentativa contada), o
+  saldo, a versão e o lançamento juntos, com `UPDATE … WHERE status = 'PENDING_REFERENCE'`;
+- várias instâncias ou workers: duas tentativas da mesma transação se serializam na wallet, e a
+  segunda encontra o estado já gravado (contada como `skipped`). Não há crédito duplo nem tentativa
+  contada duas vezes;
+- falha transitória (`TransientPersistenceError`): tudo é desfeito, a tentativa não é consumida e a
+  transação volta na próxima rodada; nunca é confundida com referência inválida. Outras falhas
+  também desfazem tudo e são logadas com `transactionId` e `walletId`;
+- reinício: nenhum estado em memória; outra instância, ou a mesma reiniciada, continua pelo banco.
+  No shutdown, o agendamento para e a rodada em andamento termina. O `MikroOrmCoreModule` é global, e
+  o Nest encerra os módulos globais por último: o ORM fecha depois de o worker terminar a rodada.
+  Uma falha do próprio log não interrompe o agendamento;
+- logs JSON só com contagens e ids, sem valores nem payloads (§12).
+
+**Categorias de falha numa tentativa** (o §7.1 limita as tentativas pela **ausência da
+referência**; falhas operacionais não são referência inexistente):
+
+| Categoria                       | Exemplos                                                                                 | Tratamento atual                                                                                                |
+| ------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Referência ausente              | BET ainda não chegou                                                                     | nova tentativa com backoff; esgotado o limite, `REJECTED` com `REFERENCE_NOT_FOUND`                             |
+| Referência existente e inválida | outra rodada, valor, BET `REJECTED`, já reembolsada                                      | `REJECTED` imediato, com o código da violação                                                                   |
+| Transitória                     | conexão, deadlock, serialização, servidor indisponível (`isTransientPersistenceFailure`) | tudo desfeito; a tentativa não é consumida; volta na rodada seguinte                                            |
+| Permanente ou desconhecida      | defeito de código, saldo acima do `bigint` no crédito                                    | tudo desfeito e logado; tentada de novo a cada rodada, sem consumir tentativa e sem virar `REFERENCE_NOT_FOUND` |
+
+A última categoria não tem saída terminal: uma linha assim fica em `PENDING_REFERENCE`
+indefinidamente. Como ela continua vencida e a busca começa pelas mais antigas, 50 ou mais linhas
+nessa situação (o tamanho do lote) ocupariam todas as rodadas e impediriam o processamento das
+demais. Nenhum caminho conhecido produz essa falha hoje: o estouro exige saldo perto de
+9,2×10¹⁶. O tratamento (`FAILED`, quarentena ou adiamento com alerta) é uma decisão pendente.
+
+**HTTP e idempotência.** Pendente → 202 com `{ status: "PENDING_REFERENCE", balance }` (saldo
+observado ao aceitar). O reenvio devolve o estado atual gravado: 202 enquanto pendente; depois, o
+resultado terminal (200 ou 422) com o saldo observado na conclusão. Conflito de payload e operação
+externa duplicada seguem iguais.
+
+**Eventos** (§7.1 e §11: `WagerTransactionPendingReference` e o `WagerTransactionRejected` do
+esgotamento): **não publicados**, decisão aprovada. Não há Outbox, e nenhuma operação publica
+eventos ainda; os eventos entram todos juntos com a Outbox transacional.
+
+**Testes**: `test/integration/pending-reference.integration.test.ts`. Cobre:
+
+- gravação pendente sem saldo, versão ou ledger, e os `CHECK`s;
+- referência incompatível já existente;
+- resolução quando a BET chega, com uma única tentativa contada e um crédito;
+- backoff persistido até o limite e `REFERENCE_NOT_FOUND`;
+- BET incompatível que chega depois, e REFUND concorrente que já reembolsou a BET;
+- 10 REFUNDs distintos e simultâneos da mesma BET, em 3 pools, com um único `PROCESSED`;
+- REFUND pendente reenviado com outra chave, que resulta em operação externa duplicada e nada
+  gravado;
+- 3 pools concorrentes;
+- REFUND e BET simultâneos;
+- 20 reenvios simultâneos e o replay depois da resolução;
+- falha transitória sem consumir a tentativa;
+- falha no meio da tentativa desfazendo transação, wallet e ledger;
+- reinício com outra instância do ORM;
+- reconciliação.
+
+Por HTTP, há 202, 200, 422 e o worker da própria aplicação resolvendo a pendência. Mutações
+conferidas:
+
+- sem a releitura do status sob o lock, o teste de workers concorrentes falha;
+- sem a consulta da regra 4, os testes de segundo REFUND falham, e o índice único barra o crédito
+  duplo.
+
+**Limites conhecidos.**
+
+- A pendência não é antecipada quando a BET chega: ela espera o próximo vencimento, que, depois de
+  algumas tentativas, pode estar a até 5 min.
+- Uma falha não transitória e repetível pode bloquear a fila (tabela acima).
+- Várias instâncias leem as mesmas linhas vencidas e esperam umas pelas outras no lock da wallet.
+  O resultado continua correto, mas há trabalho repetido; seria possível evitá-lo com
+  `SKIP LOCKED`.
+- Durante uma indisponibilidade do banco, o worker tenta de novo a cada intervalo de poll, sem
+  backoff no nível da rodada.
+- O worker roda em processo, junto da API. Não há worker separado nem métrica exportada.
 
 ## API de submissão de transações (contrato §9)
 
@@ -290,7 +421,8 @@ casas, não negativa, moeda ISO-4217, convertida direto para centavos `bigint`, 
 `number`. Campos extras são ignorados.
 
 **Saída.** Resultado gravado: `{ transactionId, status, balance, idempotentReplay }` (§9), mais
-`failureCode` quando `REJECTED` (§7.2). `balance` é o saldo observado ao concluir.
+`failureCode` quando `REJECTED` (§7.2). `balance` é o saldo observado ao concluir (em
+`PENDING_REFERENCE`, ao aceitar).
 
 **Mapeamento HTTP** (o §9 deixa a escolha ao candidato, desde que as situações sejam distintas e
 consistentes):
@@ -298,18 +430,20 @@ consistentes):
 | Situação                                                                                    | Status | Corpo                                              |
 | ------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------- |
 | `PROCESSED`, nova ou replay                                                                 | 200    | resultado                                          |
-| `REJECTED` (saldo, moeda, player), nova ou replay                                           | 422    | resultado, com `failureCode`                       |
+| `PENDING_REFERENCE` (aceita, aguardando a referência), nova ou replay                       | 202    | resultado                                          |
+| `REJECTED` (saldo, moeda, player, referência), nova ou replay                               | 422    | resultado, com `failureCode`                       |
 | Payload inválido, JSON malformado, `Idempotency-Key` ausente/vazia, valor acima do `bigint` | 400    | erro `INVALID_REQUEST`                             |
 | Wallet inexistente                                                                          | 404    | erro `WALLET_NOT_FOUND`                            |
 | Mesma chave com outro payload                                                               | 409    | erro `IDEMPOTENCY_KEY_CONFLICT`                    |
 | Mesma operação externa com outra chave                                                      | 409    | erro `DUPLICATE_EXTERNAL_TRANSACTION`              |
-| REFUND, ROLLBACK, BET ou WIN de valor zero, BET, WIN ou LOSS com referência                 | 501    | erro `UNSUPPORTED_SUBMISSION`                      |
+| ROLLBACK, BET, WIN ou REFUND de valor zero, BET, WIN ou LOSS com referência                 | 501    | erro `UNSUPPORTED_SUBMISSION`                      |
 | Falha transitória do banco                                                                  | 503    | erro `TRANSIENT_FAILURE`                           |
 | Qualquer outro erro                                                                         | 500    | `{ statusCode, message: "Internal server error" }` |
 
 Corpo de erro: `{ statusCode, error, message, code }`, com `code` estável para o provedor decidir sem
 ler a mensagem. A rejeição de negócio usa o corpo do resultado, não o de erro: ela foi gravada e é
-devolvida igual no replay. O replay mantém o status original (200 ou 422). Nenhuma resposta inclui
+devolvida igual no replay. O replay mantém o status do resultado gravado (200 ou 422; 202 enquanto
+a referência não é resolvida, depois o status do resultado terminal). Nenhuma resposta inclui
 stack, SQL ou a chave de idempotência de outra submissão.
 
 **Falha transitória.** O repositório converte para `TransientPersistenceError` os SQLSTATEs `08xxx`,
@@ -327,12 +461,14 @@ PostgreSQL de teste): BET aplicada e rejeitada, replays, conflitos, cenário obr
 sobre 100 por HTTP (200 e 422, saldo `20.00`, um débito; reentrega sem débito novo), dez BETs
 simultâneas, WIN creditado, replay e conflito de WIN, WIN em moeda incompatível (422), BET e WIN
 simultâneos, LOSS registrado sem lançamento (inclusive de valor zero), replay e conflito de LOSS,
-LOSS em moeda incompatível (422), entradas inválidas sem efeito e falhas sem vazamento. As requisições simultâneas vão a
-uma única instância da aplicação; o cenário com processos independentes está em
+LOSS em moeda incompatível (422), REFUND antes da BET (202, replay 202), REFUND aplicado (200),
+REFUND com referência incompatível (422), segundo REFUND da mesma BET (422) e o worker agendado
+da aplicação resolvendo a pendência (o reenvio passa a 200), entradas inválidas sem efeito e falhas
+sem vazamento. Nesses testes o worker fica desligado, exceto no teste do agendamento. As requisições
+simultâneas vão a uma única instância da aplicação; o cenário com processos independentes está em
 `bet-processing.integration.test.ts`.
 
-**Limitações.** `PENDING_REFERENCE` (aceite pendente, previsto como 202) não é produzido nesta etapa.
-`POST /wallets` ainda usa o corpo de erro padrão do Nest, sem `code`: a consistência do formato
+**Limitações.** `POST /wallets` ainda usa o corpo de erro padrão do Nest, sem `code`: a consistência do formato
 entre endpoints (§9) fica pendente. Um header `Idempotency-Key` repetido chega ao Node como valores
 unidos por vírgula e é aceito como uma única chave.
 
@@ -356,14 +492,18 @@ unidos por vírgula e é aceito como uma única chave.
     aplicação na implantação.
 - **Ids**: UUID v4 (`randomUUID`); os exemplos do contrato usam UUID v7, o que não é exigido.
 - **Regras de negócio sem definição no contrato**, ainda abertas: tratamento de BET e WIN de valor
-  zero; se BET e LOSS admitem referência e o que um LOSS referenciaria; se a BET referenciada por um
-  WIN precisa estar `PROCESSED`; e se há limite de WINs por rodada ou por BET (o contrato não
-  define, e nada foi limitado). LOSS de valor zero segue a regra registrada no projeto (aceito). A
-  taxonomia de `failureCode` cobre BET, WIN e LOSS (seção acima).
+  zero (e de REFUND de valor zero); se BET e LOSS admitem referência e o que um LOSS referenciaria;
+  se a BET referenciada por um WIN precisa estar `PROCESSED`; e se há limite de WINs por rodada ou
+  por BET (o contrato não define, e nada foi limitado). LOSS de valor zero segue a regra registrada
+  no projeto (aceito). A taxonomia de `failureCode` cobre BET, WIN, LOSS e REFUND (seção acima).
+- **Worker de referências pendentes no banco, não no SQS**: a fila FIFO não permite atraso por
+  mensagem, e o estado (tentativas, próxima data) precisa ser persistente e consultável. A busca é
+  periódica e indexada, e cada rodada é limitada. Trade-off: há latência de até um intervalo de
+  poll além do backoff.
 
 ## Ainda não implementado
 
-WIN e LOSS com referência, REFUND e ROLLBACK, `PENDING_REFERENCE` e seu worker (§7.1),
-Inbox/Outbox, consumo SQS, retry e DLQ (§6.5, §10 e §11), consultas e reconciliação pela API
-(`GET /wallets/:id`, ledger, transações), autenticação real (§2), observabilidade (§12) e
-`GET /health/ready`.
+WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), eventos de `PENDING_REFERENCE` e do
+esgotamento (§7.1 e §11, com a Outbox), Inbox/Outbox, consumo SQS, retry e DLQ (§6.5, §10 e §11),
+consultas e reconciliação pela API (`GET /wallets/:id`, ledger, transações), autenticação real
+(§2), observabilidade (§12: métricas) e `GET /health/ready`.
