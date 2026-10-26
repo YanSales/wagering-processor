@@ -32,27 +32,7 @@ export interface BetInput {
  */
 export function applyBet(input: BetInput): WalletLedgerEntry {
   const { transaction, wallet } = input;
-  if (transaction.kind !== WagerTransactionKind.Bet) {
-    throw new InvalidWagerTransactionError(
-      `applyBet aceita apenas BET; recebido ${transaction.kind}.`,
-    );
-  }
-  if (transaction.isTerminal()) {
-    throw new InvalidTransactionStateError(
-      transaction.id,
-      transaction.status,
-      'applyBet',
-      'o estado atual é terminal.',
-    );
-  }
-  if (transaction.walletId !== wallet.id) {
-    throw new InvalidWagerTransactionError(
-      `a transação ${transaction.id} pertence à wallet ${transaction.walletId}, não à ${wallet.id}.`,
-    );
-  }
-  if (transaction.playerId !== wallet.playerId) {
-    throw new WalletPlayerMismatchError(wallet.id, wallet.playerId, transaction.playerId);
-  }
+  assertMovementPreconditions(transaction, wallet, WagerTransactionKind.Bet, 'applyBet');
 
   // `debit` valida moeda, valor e saldo antes de alterar a wallet.
   const entry = wallet.debit({
@@ -64,6 +44,40 @@ export function applyBet(input: BetInput): WalletLedgerEntry {
   // Não falha: estado não terminal, BET sem referência e data já validada pelo débito.
   transaction.markProcessed(undefined, input.at);
   return entry;
+}
+
+/**
+ * Pré-condições comuns a uma movimentação de wallet por transação submetida (BET, WIN): tipo
+ * esperado, estado não terminal, transação da wallet informada (erro de programação se não for) e
+ * wallet do mesmo player (`WalletPlayerMismatchError`, violação de negócio). Não altera nada.
+ */
+export function assertMovementPreconditions(
+  transaction: WagerTransaction,
+  wallet: Wallet,
+  kind: WagerTransactionKind,
+  operation: string,
+): void {
+  if (transaction.kind !== kind) {
+    throw new InvalidWagerTransactionError(
+      `${operation} aceita apenas ${kind}; recebido ${transaction.kind}.`,
+    );
+  }
+  if (transaction.isTerminal()) {
+    throw new InvalidTransactionStateError(
+      transaction.id,
+      transaction.status,
+      operation,
+      'o estado atual é terminal.',
+    );
+  }
+  if (transaction.walletId !== wallet.id) {
+    throw new InvalidWagerTransactionError(
+      `a transação ${transaction.id} pertence à wallet ${transaction.walletId}, não à ${wallet.id}.`,
+    );
+  }
+  if (transaction.playerId !== wallet.playerId) {
+    throw new WalletPlayerMismatchError(wallet.id, wallet.playerId, transaction.playerId);
+  }
 }
 
 /** Erro de domínio: a wallet informada pertence a outro player. Wallet e transação inalteradas. */

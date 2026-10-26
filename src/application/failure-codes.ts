@@ -17,8 +17,11 @@ export const FailureCodes = {
   PlayerWalletMismatch: 'PLAYER_WALLET_MISMATCH',
 } as const satisfies Record<string, FailureCode>;
 
-/** Código de rejeição de negócio para um erro de domínio da BET, ou `undefined` se não for um. */
-export function betFailureCodeFor(error: unknown): FailureCode | undefined {
+/**
+ * Código de rejeição de negócio para um erro de domínio de uma movimentação (BET, WIN), ou
+ * `undefined` se não for um. O WIN só produz `CURRENCY_MISMATCH` e `PLAYER_WALLET_MISMATCH`.
+ */
+export function movementFailureCodeFor(error: unknown): FailureCode | undefined {
   if (error instanceof InsufficientFundsError) return FailureCodes.InsufficientFunds;
   if (error instanceof CurrencyMismatchError) return FailureCodes.CurrencyMismatch;
   if (error instanceof WalletPlayerMismatchError) return FailureCodes.PlayerWalletMismatch;

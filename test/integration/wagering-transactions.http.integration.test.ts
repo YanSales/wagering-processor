@@ -176,6 +176,87 @@ describe('POST /wagering/transactions: BET', () => {
   });
 });
 
+describe('POST /wagering/transactions: WIN sem referência', () => {
+  test('WIN válido: 200, crédito, CREDIT e resultado gravados', async () => {
+    const wallet = await openWallet('20.00');
+    const body = betBody(wallet, '50.00', { kind: 'WIN' });
+
+    const response = await submit(body, keyOf(body));
+
+    expect(response.status).toBe(200);
+    expect(await json(response)).toEqual({
+      transactionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      status: 'PROCESSED',
+      balance: { amount: '70.00', currency: 'BRL' },
+      idempotentReplay: false,
+    });
+    const [credits] = await sql<{ count: number }>(
+      `select count(*)::int as count from wallet_ledger_entries
+        where wallet_id = ? and direction = 'CREDIT'`,
+      [wallet.id],
+    );
+    expect(credits?.count).toBe(2); // OPENING e WIN
+    expect(await walletState(wallet.id)).toMatchObject({ balance: '7000', rebuilt: '7000' });
+  });
+
+  test('replay: mesmo status e corpo, sem novo crédito; outro payload na chave: 409', async () => {
+    const wallet = await openWallet('0.00');
+    const body = betBody(wallet, '12.34', { kind: 'WIN' });
+    const first = await json(await submit(body, keyOf(body)));
+
+    const replay = await submit(body, keyOf(body));
+    const conflict = await submit(
+      { ...body, money: { amount: '12.35', currency: 'BRL' } },
+      keyOf(body),
+    );
+
+    expect(replay.status).toBe(200);
+    expect(await json(replay)).toEqual({ ...first, idempotentReplay: true });
+    expect(conflict.status).toBe(409);
+    expect(await json(conflict)).toMatchObject({ code: 'IDEMPOTENCY_KEY_CONFLICT' });
+    expect(await walletState(wallet.id)).toMatchObject({ balance: '1234', bets: 0 });
+  });
+
+  test('moeda incompatível: 422 REJECTED com CURRENCY_MISMATCH, sem crédito', async () => {
+    const wallet = await openWallet('20.00');
+    const body = betBody(wallet, '1.00', {
+      kind: 'WIN',
+      money: { amount: '1.00', currency: 'USD' },
+    });
+
+    const response = await submit(body, keyOf(body));
+
+    expect(response.status).toBe(422);
+    expect(await json(response)).toMatchObject({
+      status: 'REJECTED',
+      failureCode: 'CURRENCY_MISMATCH',
+      balance: { amount: '20.00', currency: 'BRL' },
+    });
+    expect((await walletState(wallet.id)).balance).toBe('2000');
+  });
+
+  test('BET e WIN simultâneos na mesma wallet: resultado consistente com o ledger', async () => {
+    const wallet = await openWallet('10.00');
+    const bet = betBody(wallet, '30.00');
+    const win = betBody(wallet, '30.00', { kind: 'WIN' });
+
+    const [betResponse, winResponse] = await Promise.all([
+      submit(bet, keyOf(bet)),
+      submit(win, keyOf(win)),
+    ]);
+
+    expect(winResponse.status).toBe(200);
+    // A BET passa só se for serializada depois do WIN; em qualquer ordem o saldo bate com o ledger.
+    const betApplied = betResponse.status === 200;
+    expect([200, 422]).toContain(betResponse.status);
+    expect(await walletState(wallet.id)).toMatchObject({
+      balance: betApplied ? '1000' : '4000',
+      rebuilt: betApplied ? '1000' : '4000',
+      debits: betApplied ? 1 : 0,
+    });
+  });
+});
+
 describe('POST /wagering/transactions: idempotência', () => {
   test('mesma chave e mesmo payload: mesmo status e corpo, com idempotentReplay e sem novo débito', async () => {
     const wallet = await openWallet('100.00');
@@ -382,7 +463,8 @@ describe('POST /wagering/transactions: requisições recusadas sem efeito', () =
   });
 
   test.each([
-    ['WIN', { kind: 'WIN' }],
+    ['WIN com referência', { kind: 'WIN', referenceExternalTransactionId: 'tx-0' }],
+    ['WIN de valor zero', { kind: 'WIN', money: { amount: '0.00', currency: 'BRL' } }],
     ['LOSS', { kind: 'LOSS' }],
     ['REFUND', { kind: 'REFUND', referenceExternalTransactionId: 'tx-0' }],
     ['ROLLBACK', { kind: 'ROLLBACK', referenceExternalTransactionId: 'tx-0' }],

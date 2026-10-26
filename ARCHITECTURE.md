@@ -120,15 +120,16 @@ condicionado ou combinação) seja justificada aqui. O broker é otimização, n
 
 ### Estratégia escolhida: lock pessimista da linha da wallet
 
-Implementada para `BET` em `MikroOrmWagerTransactionRepository.applyToLockedWallet`. Numa única
-transação SQL, no isolamento padrão do PostgreSQL (`READ COMMITTED`):
+Implementada para `BET` e `WIN` em `MikroOrmWagerTransactionRepository.applyToLockedWallet`, o mesmo
+caminho para débitos e créditos. Numa única transação SQL, no isolamento padrão do PostgreSQL
+(`READ COMMITTED`):
 
 1. `SELECT … FROM wallets WHERE id = ? FOR UPDATE` (`LockMode.PESSIMISTIC_WRITE`);
 2. nova consulta de idempotência, já sob o lock;
-3. decisão de domínio (`applyBet`) sobre a wallet lida;
+3. decisão de domínio (`applyBet` ou `applyWin`) sobre a wallet lida;
 4. `INSERT` da transação (estado final, `failureCode`, saldo observado);
-5. se houve débito: `UPDATE wallets … WHERE id = ? AND version = <versão lida>` e `INSERT` do
-   lançamento `DEBIT`;
+5. se houve movimentação: `UPDATE wallets … WHERE id = ? AND version = <versão lida>` e `INSERT` do
+   lançamento (`DEBIT` na BET, `CREDIT` no WIN);
 6. `COMMIT`. Qualquer erro desfaz tudo.
 
 **Por que lock pessimista.** A BET concorrente precisa de um resultado de negócio (`REJECTED` por
@@ -144,8 +145,9 @@ para gravar a rejeição com o saldo observado. Com o lock, a decisão continua 
 linha travada; nenhuma outra transação de qualquer instância escreve na wallet nesse intervalo. Em
 defesa adicional: o `UPDATE` exige a versão lida (afetar zero linhas aborta a transação), o
 `CHECK (balance_cents >= 0)` da wallet e os `CHECK`s de saldo e equação contábil do ledger. Um teste
-de mutação (remover o `FOR UPDATE`) faz falhar os três testes de BETs concorrentes: a guarda de
-versão aborta as transações perdedoras.
+de mutação (remover o `FOR UPDATE`) faz falhar os três testes de BETs concorrentes e os três de WINs
+concorrentes (créditos perdidos, BET e WIN misturados, processos independentes): a guarda de versão
+aborta as transações perdedoras.
 
 **Escopo do lock.** Uma linha de `wallets` (a unidade de concorrência é a `walletId`). Não há lock
 global nem em memória. Cada transação trava uma única wallet, portanto não há ciclo de locks entre
@@ -176,6 +178,11 @@ exatamente uma vez.
   processo → dez aplicadas, dez rejeitadas, saldo `0.00`, nenhum saldo negativo.
 - Reconciliação ao final: em todas as wallets do banco de teste, saldo materializado igual à soma do
   ledger; toda BET `PROCESSED` com exatamente um `DEBIT` e toda `REJECTED` sem lançamento.
+- WIN (`test/integration/win-processing.integration.test.ts`): vinte WINs simultâneos por dois pools
+  sem crédito perdido (saldo e versão exatos); BETs e WINs simultâneos na mesma wallet com saldo
+  nunca negativo e igual ao ledger; três processos independentes, um WIN cada; WIN numa wallet
+  enquanto outra está travada; e a mesma reconciliação para todo WIN (`PROCESSED` com um `CREDIT`,
+  `REJECTED` sem lançamento).
 
 O que esses testes **não** comprovam: execução com várias instâncias da aplicação NestJS completa ou
 em máquinas diferentes. Os processos do teste usam o mesmo caso de uso e repositório da aplicação,
@@ -183,23 +190,37 @@ contra o mesmo PostgreSQL, que é quem garante a serialização.
 
 ### Pendente
 
-- Aplicar a mesma estratégia aos créditos e reversões (WIN, REFUND, ROLLBACK) quando forem
+- Aplicar a mesma estratégia às reversões (REFUND, ROLLBACK) e ao WIN com referência quando forem
   implementados, reutilizando `applyToLockedWallet`.
 - Timeout de espera pelo lock (`lock_timeout`) não está configurado: uma transação presa seguraria
-  as BETs daquela wallet até o timeout de conexão ou o fim da transação.
+  as operações daquela wallet até o timeout de conexão ou o fim da transação.
 
-## Processamento de BET e idempotência (contrato §7 e §9)
+## Processamento de BET e WIN, e idempotência (contrato §7 e §9)
 
-Caso de uso `SubmitWagerTransaction` (`src/application/submit-wager-transaction.ts`). Nesta etapa só
-processa `BET`. Exposto por `POST /wagering/transactions` (seção seguinte); não há consumidor SQS.
+Caso de uso `SubmitWagerTransaction` (`src/application/submit-wager-transaction.ts`). Nesta etapa
+processa `BET` e `WIN` sem referência, pelo mesmo fluxo (a regra de domínio é escolhida pelo tipo).
+Exposto por `POST /wagering/transactions` (seção seguinte); não há consumidor SQS.
 
-- **Regras** (domínio, `applyBet`): débito com um lançamento `DEBIT` e transação `PROCESSED`; saldo
+- **BET** (domínio, `applyBet`): débito com um lançamento `DEBIT` e transação `PROCESSED`; saldo
   insuficiente, moeda diferente da wallet ou wallet de outro player → `REJECTED`, sem lançamento e
   sem alterar saldo nem versão (§6.4 e §7, regra 6). A rejeição é gravada e auditável.
+- **WIN sem referência** (domínio, `applyWin`, §7 tabela: crédito, 1 lançamento `CREDIT`): crédito e
+  transação `PROCESSED`, sem regra de saldo; moeda diferente da wallet ou wallet de outro player →
+  `REJECTED`, como na BET. As pré-condições comuns (tipo, estado, wallet, player) ficam em
+  `assertMovementPreconditions`.
+- **WIN com referência: não processado** (`UnsupportedSubmissionError`, HTTP 501). O contrato diz
+  que o WIN "pode referenciar a BET da mesma rodada" (§7), com a referência do mesmo provider,
+  player, wallet, moeda e rodada (regra 2). Mas: referência ausente exige `PENDING_REFERENCE` com
+  worker agendado e limite de tentativas (regra 8 e §7.1), que ainda não existem; e o contrato não
+  define o que fazer se a BET referenciada existir sem estar `PROCESSED` (a exigência de `PROCESSED`
+  está escrita só para REFUND e ROLLBACK). Implementar só o caso "referência presente e válida"
+  deixaria o comportamento dependente da ordem de chegada (§3), por isso nada com referência é
+  aceito por enquanto. O contrato também não limita o número de WINs por rodada ou por BET; nenhuma
+  restrição foi criada.
 - **`failureCode`** (§7.2, taxonomia própria, `src/application/failure-codes.ts`):
-  `INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `PLAYER_WALLET_MISMATCH`. Só os códigos que esta etapa
-  produz; o código de reversão sem saldo (§7, regra 9) e o de referência inexistente (§7.1) entram com
-  essas operações.
+  `INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `PLAYER_WALLET_MISMATCH` (o WIN usa os dois últimos).
+  Só os códigos que esta etapa produz; o código de reversão sem saldo (§7, regra 9) e o de
+  referência inexistente (§7.1) entram com essas operações.
 - **`payloadHash`** (§9): SHA-256 hexadecimal do JSON canônico (chaves ordenadas, sem espaços) de
   `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`,
   `money` (`{ amount, currency }`, 2 casas) e `referenceExternalTransactionId` quando presente. A
@@ -218,10 +239,14 @@ processa `BET`. Exposto por `POST /wagering/transactions` (seção seguinte); n�
   `Migration20261026012348_bet_result_balance`), obrigatória em submissões `PROCESSED`/`REJECTED`
   (`CHECK`) e não negativa. Pré-condição da migration: não existirem submissões concluídas sem esse
   valor; antes desta etapa nenhum código as gravava (só a `OPENING`, isenta).
-- **Recusado sem gravar nada** (regras não definidas pelo contrato ou fora desta etapa): `WIN`,
-  `LOSS`, `REFUND`, `ROLLBACK`, BET de valor `0.00`, BET com `referenceExternalTransactionId`
+- **Recusado sem gravar nada** (regras não definidas pelo contrato ou fora desta etapa): `LOSS`,
+  `REFUND`, `ROLLBACK`, BET ou WIN de valor `0.00`, BET ou WIN com `referenceExternalTransactionId`
   (`UnsupportedSubmissionError`); wallet inexistente (`WalletNotFoundError`; a FK impede gravar a
   transação).
+- **Limite de armazenamento**: um WIN que levaria o saldo acima do `bigint` (`92233720368547758.07`)
+  é recusado antes de gravar (`AmountOutOfStorageRangeError`; testado no PostgreSQL, nada é
+  gravado). No HTTP vira 400 `INVALID_REQUEST`, como a entrada fora da faixa; a mensagem começa por
+  `money:` embora a causa seja o saldo resultante.
 - **Reutilização**: `POST /wagering/transactions` já chama este caso de uso; o consumidor SQS deverá
   chamar o mesmo `SubmitWagerTransaction`, com a chave de idempotência da mensagem. O consumidor
   ainda precisará da Inbox e do Outbox na mesma transação (§6.5), que não existem.
@@ -256,7 +281,7 @@ consistentes):
 | Wallet inexistente                                                                          | 404    | erro `WALLET_NOT_FOUND`                            |
 | Mesma chave com outro payload                                                               | 409    | erro `IDEMPOTENCY_KEY_CONFLICT`                    |
 | Mesma operação externa com outra chave                                                      | 409    | erro `DUPLICATE_EXTERNAL_TRANSACTION`              |
-| WIN, LOSS, REFUND, ROLLBACK, BET de valor zero, BET com referência                          | 501    | erro `UNSUPPORTED_SUBMISSION`                      |
+| LOSS, REFUND, ROLLBACK, BET ou WIN de valor zero, BET ou WIN com referência                 | 501    | erro `UNSUPPORTED_SUBMISSION`                      |
 | Falha transitória do banco                                                                  | 503    | erro `TRANSIENT_FAILURE`                           |
 | Qualquer outro erro                                                                         | 500    | `{ statusCode, message: "Internal server error" }` |
 
@@ -278,7 +303,8 @@ iniciada depois.
 **Testes** (`test/integration/wagering-transactions.http.integration.test.ts`, `AppModule` real e
 PostgreSQL de teste): BET aplicada e rejeitada, replays, conflitos, cenário obrigatório 80/80
 sobre 100 por HTTP (200 e 422, saldo `20.00`, um débito; reentrega sem débito novo), dez BETs
-simultâneas, entradas inválidas sem efeito e falhas sem vazamento. As requisições simultâneas vão a
+simultâneas, WIN creditado, replay e conflito de WIN, WIN em moeda incompatível (422), BET e WIN
+simultâneos, entradas inválidas sem efeito e falhas sem vazamento. As requisições simultâneas vão a
 uma única instância da aplicação; o cenário com processos independentes está em
 `bet-processing.integration.test.ts`.
 
@@ -307,12 +333,13 @@ unidos por vírgula e é aceito como uma única chave.
     aplicação na implantação.
 - **Ids**: UUID v4 (`randomUUID`); os exemplos do contrato usam UUID v7, o que não é exigido.
 - **Regras de negócio sem definição no contrato**, ainda abertas: tratamento de operações de valor
-  zero e se WIN, BET e LOSS exigem ou admitem referência. A taxonomia de `failureCode` está definida
-  só para a BET (seção acima).
+  zero; se BET e LOSS admitem referência; se a BET referenciada por um WIN precisa estar
+  `PROCESSED`; e se há limite de WINs por rodada ou por BET (o contrato não define, e nada foi
+  limitado). A taxonomia de `failureCode` cobre só BET e WIN (seção acima).
 
 ## Ainda não implementado
 
-Processamento de WIN, LOSS, REFUND e ROLLBACK, `PENDING_REFERENCE` e seu worker (§7.1),
+WIN com referência, LOSS, REFUND e ROLLBACK, `PENDING_REFERENCE` e seu worker (§7.1),
 Inbox/Outbox, consumo SQS, retry e DLQ (§6.5, §10 e §11), consultas e reconciliação pela API
 (`GET /wallets/:id`, ledger, transações), autenticação real (§2), observabilidade (§12) e
 `GET /health/ready`.

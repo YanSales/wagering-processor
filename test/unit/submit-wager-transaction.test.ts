@@ -245,10 +245,92 @@ describe('SubmitWagerTransaction: idempotência', () => {
   });
 });
 
+describe('SubmitWagerTransaction: WIN sem referência', () => {
+  const win = (overrides: Partial<SubmitWagerTransactionCommand> = {}) =>
+    bet({
+      kind: WagerTransactionKind.Win,
+      idempotencyKey: 'provider-a:win-1',
+      externalTransactionId: 'win-1',
+      money: brl(5_000n),
+      ...overrides,
+    });
+
+  test('PROCESSED: saldo creditado, versão incrementada e um lançamento CREDIT', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(2_000n);
+
+    const result = await useCase.execute(win());
+
+    expect(result).toMatchObject({ status: Processed, idempotentReplay: false });
+    expect(result.failureCode).toBeUndefined();
+    expect(result.balance.cents).toBe(7_000n);
+    expect(repository.wallets.get('wallet-1')).toMatchObject({ version: 2 });
+    expect(repository.entries.map((e) => [e.direction, e.money.cents])).toEqual([
+      ['CREDIT', 5_000n],
+    ]);
+  });
+
+  test('credita mesmo com saldo zero (não há regra de saldo para crédito)', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(0n);
+
+    expect((await useCase.execute(win())).balance.cents).toBe(5_000n);
+  });
+
+  test.each([
+    ['moeda incompatível', { money: Money.fromCents(100n, 'USD') }, FailureCodes.CurrencyMismatch],
+    ['wallet de outro player', { playerId: 'player-2' }, FailureCodes.PlayerWalletMismatch],
+  ])('%s: REJECTED com failureCode, sem crédito nem lançamento', async (_case, overrides, code) => {
+    const { repository, useCase } = setup();
+    repository.addWallet(2_000n);
+
+    const result = await useCase.execute(win(overrides));
+
+    expect(result).toMatchObject({ status: Rejected, failureCode: code });
+    expect(result.balance.cents).toBe(2_000n);
+    expect(repository.entries).toEqual([]);
+    expect(repository.wallets.get('wallet-1')?.version).toBe(1);
+  });
+
+  test('replay devolve o resultado original; conflito e operação duplicada não creditam de novo', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(2_000n);
+    const first = await useCase.execute(win());
+
+    expect(await useCase.execute(win())).toEqual({ ...first, idempotentReplay: true });
+    await expect(useCase.execute(win({ money: brl(5_001n) }))).rejects.toBeInstanceOf(
+      IdempotencyConflictError,
+    );
+    await expect(useCase.execute(win({ idempotencyKey: 'outra' }))).rejects.toBeInstanceOf(
+      DuplicateExternalTransactionError,
+    );
+    expect(repository.entries).toHaveLength(1);
+    expect(repository.wallets.get('wallet-1')?.balance.cents).toBe(7_000n);
+  });
+
+  test('a mesma operação externa não pode ser BET e WIN', async () => {
+    const { repository, useCase } = setup();
+    repository.addWallet(10_000n);
+    await useCase.execute(bet());
+
+    await expect(
+      useCase.execute(bet({ kind: WagerTransactionKind.Win, idempotencyKey: 'outra' })),
+    ).rejects.toBeInstanceOf(DuplicateExternalTransactionError);
+    expect(repository.entries).toHaveLength(1);
+  });
+});
+
 describe('SubmitWagerTransaction: submissões recusadas sem gravar', () => {
   test.each([
     ['OPENING (interno)', bet({ kind: WagerTransactionKind.Opening })],
-    ['WIN (fora desta etapa)', bet({ kind: WagerTransactionKind.Win })],
+    [
+      'WIN com referência (PENDING_REFERENCE e §7.1 ainda não existem)',
+      bet({ kind: WagerTransactionKind.Win, referenceExternalTransactionId: 'tx-0' }),
+    ],
+    [
+      'WIN de valor zero (regra não definida)',
+      bet({ kind: WagerTransactionKind.Win, money: brl(0n) }),
+    ],
     ['LOSS (fora desta etapa)', bet({ kind: WagerTransactionKind.Loss })],
     [
       'REFUND (fora desta etapa)',

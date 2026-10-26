@@ -7,7 +7,8 @@ import {
   WagerTransactionKind,
   type WagerTransactionStatus,
 } from '../domain/wager-transaction';
-import { betFailureCodeFor } from './failure-codes';
+import { applyWin } from '../domain/win';
+import { movementFailureCodeFor } from './failure-codes';
 import { computeWagerPayloadHash } from './payload-hash';
 import type {
   ExistingSubmissions,
@@ -40,18 +41,18 @@ export interface SubmissionResult {
 }
 
 /**
- * Processa uma submissão de transação. Nesta etapa, somente `BET`.
+ * Processa uma submissão de transação. Nesta etapa, `BET` e `WIN` sem referência.
  *
  * - Idempotência (§9): a mesma `idempotencyKey` com o mesmo `payloadHash` devolve o resultado
  *   original (`idempotentReplay: true`), inclusive o saldo observado na época (§7, regra 7); com
  *   outro payload, `IdempotencyConflictError`. O mesmo `(providerId, externalTransactionId)` sob
  *   outra chave é `DuplicateExternalTransactionError`. Nenhum desses casos aplica efeito.
- * - BET nova: a persistência trava a wallet; `applyBet` debita e a transação vira `PROCESSED`, ou
- *   uma violação de negócio a torna `REJECTED` com `failureCode`, sem lançamento. Tudo na mesma
- *   transação SQL.
+ * - Submissão nova: a persistência trava a wallet; `applyBet` debita (BET) ou `applyWin` credita
+ *   (WIN) e a transação vira `PROCESSED`, ou uma violação de negócio a torna `REJECTED` com
+ *   `failureCode`, sem lançamento. Tudo na mesma transação SQL.
  * - Recusados sem gravar nada (`UnsupportedSubmissionError`): outros tipos (fora desta etapa) e
- *   casos sem regra definida (BET de valor zero, BET com referência). Wallet inexistente:
- *   `WalletNotFoundError`.
+ *   casos sem regra definida (valor zero, BET com referência, WIN com referência). Wallet
+ *   inexistente: `WalletNotFoundError`.
  *
  * Reutilizável por qualquer entrada (HTTP, consumidor SQS): a garantia está no banco, não no
  * chamador.
@@ -94,17 +95,19 @@ export class SubmitWagerTransaction {
     });
     const ledgerEntryId = this.newId();
 
+    const apply = MOVEMENTS[command.kind as SupportedKind];
     const outcome = await this.transactions.applyToLockedWallet(
       command.walletId,
       keys,
       (wallet) => {
         try {
-          const ledgerEntry = applyBet({ transaction, wallet, ledgerEntryId, at });
+          const ledgerEntry = apply({ transaction, wallet, ledgerEntryId, at });
           return { transaction, wallet, ledgerEntry };
         } catch (error) {
-          const code = betFailureCodeFor(error);
+          const code = movementFailureCodeFor(error);
           if (code === undefined) throw error;
-          // `applyBet` não altera wallet nem transação ao falhar: rejeição sem lançamento (§7, regra 6).
+          // `applyBet`/`applyWin` não alteram wallet nem transação ao falhar: rejeição sem
+          // lançamento (§7, regra 6).
           transaction.reject(code);
           return { transaction, wallet, ledgerEntry: null };
         }
@@ -120,8 +123,15 @@ export class SubmitWagerTransaction {
   }
 }
 
+/** Tipos processados nesta etapa e a regra de domínio de cada um (contrato §7, tabela). */
+const MOVEMENTS = {
+  [WagerTransactionKind.Bet]: applyBet,
+  [WagerTransactionKind.Win]: applyWin,
+} as const;
+type SupportedKind = keyof typeof MOVEMENTS;
+
 function assertSupported(command: SubmitWagerTransactionCommand): void {
-  if (command.kind !== WagerTransactionKind.Bet) {
+  if (!Object.hasOwn(MOVEMENTS, command.kind)) {
     throw new UnsupportedSubmissionError(
       command.kind === WagerTransactionKind.Opening
         ? 'OPENING é interno e não pode ser submetido.'
@@ -129,10 +139,17 @@ function assertSupported(command: SubmitWagerTransactionCommand): void {
     );
   }
   if (command.referenceExternalTransactionId !== undefined) {
-    throw new UnsupportedSubmissionError('BET com referência: a regra ainda não foi definida.');
+    throw new UnsupportedSubmissionError(
+      command.kind === WagerTransactionKind.Win
+        ? 'WIN com referência: PENDING_REFERENCE e seu reprocessamento (§7.1) ainda não existem, ' +
+            'e o contrato não define o caso de uma BET referenciada que não esteja PROCESSED.'
+        : `${command.kind} com referência: a regra ainda não foi definida.`,
+    );
   }
   if (command.money.isZero()) {
-    throw new UnsupportedSubmissionError('BET de valor zero: a regra ainda não foi definida.');
+    throw new UnsupportedSubmissionError(
+      `${command.kind} de valor zero: a regra ainda não foi definida.`,
+    );
   }
 }
 
