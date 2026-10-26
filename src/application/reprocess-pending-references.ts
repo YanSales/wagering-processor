@@ -20,17 +20,24 @@ export interface ReprocessSummary {
   skipped: number;
   /** Falhas transitórias: nada gravado, tentativa não consumida; voltam na próxima rodada. */
   transientFailures: number;
-  /** Falhas inesperadas: nada gravado; relatadas a `onError`. */
+  /** Falhas inesperadas (operacionais): tentativa desfeita; relatadas a `onError`. */
   failures: number;
+  /** Falhas operacionais postas em quarentena (próxima tentativa adiada com backoff). */
+  deferred: number;
+  /** Adiamentos que não puderam ser gravados: a transação continua vencida; relatados a `onError`. */
+  deferFailures: number;
 }
+
+/** Etapa de uma falha relatada: a tentativa de resolução ou o adiamento que a seguiu. */
+export type ReprocessFailureStage = 'attempt' | 'defer';
 
 export interface ReprocessOptions {
   batchSize: number;
   now?: () => Date;
   newId?: () => string;
   policy?: ReferenceRetryPolicy;
-  /** Recebe cada falha inesperada (a rodada continua com as demais transações). */
-  onError?: (task: PendingReferenceTask, error: unknown) => void;
+  /** Recebe cada falha inesperada e cada falha de adiamento; a rodada continua com as demais. */
+  onError?: (task: PendingReferenceTask, error: unknown, stage: ReprocessFailureStage) => void;
 }
 
 /**
@@ -43,6 +50,12 @@ export interface ReprocessOptions {
  *
  * Seguro com várias instâncias: a persistência trava a wallet e relê o estado antes de decidir, então
  * uma transação é concluída uma única vez. Falha transitória não consome tentativa nem rejeita.
+ *
+ * Falha operacional (nem transitória nem de negócio: defeito, valor fora do armazenamento): a
+ * tentativa é desfeita e, depois do rollback, a transação entra em quarentena — próxima tentativa
+ * adiada com o mesmo backoff exponencial e teto da política, sem consumir tentativa de resolução e
+ * sem limite de ocorrências. Ela nunca vira `REFERENCE_NOT_FOUND` por falhar, nem `FAILED` (política
+ * terminal ainda não decidida), e deixa de ocupar as rodadas seguintes enquanto adiada.
  */
 export class ReprocessPendingReferences {
   readonly #now: () => Date;
@@ -74,12 +87,14 @@ export class ReprocessPendingReferences {
       skipped: 0,
       transientFailures: 0,
       failures: 0,
+      deferred: 0,
+      deferFailures: 0,
     };
 
     for (const task of tasks) {
+      const at = this.#now();
       try {
         let decided: SubmissionDecision | undefined;
-        const at = this.#now();
         const ledgerEntryId = this.#newId();
         const resolved = await this.pending.resolvePendingReference(task, at, (state) => {
           if (state.transaction.kind !== WagerTransactionKind.Refund) {
@@ -105,14 +120,43 @@ export class ReprocessPendingReferences {
         }
       } catch (error) {
         if (error instanceof TransientPersistenceError) {
+          // Sem quarentena: a causa é do ambiente, não da transação; volta na próxima rodada.
           summary.transientFailures += 1;
         } else {
           summary.failures += 1;
-          this.options.onError?.(task, error);
+          this.options.onError?.(task, error, 'attempt');
+          await this.#defer(task, at, summary);
         }
       }
     }
     return summary;
+  }
+
+  #defer(task: PendingReferenceTask, at: Date, summary: ReprocessSummary): Promise<void> {
+    return deferAfterFailure(this.pending, this.#policy, task, at, summary, this.options.onError);
+  }
+}
+
+/**
+ * Quarentena depois do rollback da tentativa (a transação que falhou já foi desfeita). Uma falha aqui
+ * só é relatada: a transação continua vencida e volta na próxima rodada, e as demais seguem.
+ */
+async function deferAfterFailure(
+  pending: PendingReferenceRepository,
+  policy: ReferenceRetryPolicy,
+  task: PendingReferenceTask,
+  at: Date,
+  summary: ReprocessSummary,
+  onError: ReprocessOptions['onError'],
+): Promise<void> {
+  try {
+    const deferred = await pending.deferAfterFailure(task, at, (previousFailures) =>
+      policy.nextAttemptAfterFailure(previousFailures, at),
+    );
+    if (deferred) summary.deferred += 1;
+  } catch (error) {
+    summary.deferFailures += 1;
+    onError?.(task, error, 'defer');
   }
 }
 

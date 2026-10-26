@@ -25,7 +25,9 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
   no PostgreSQL e idempotência persistente;
 - REFUND que chega antes da BET: gravado em `PENDING_REFERENCE` (HTTP 202) e resolvido pelo worker
   agendado de cada instância, com backoff exponencial e limite de tentativas (§7.1); esgotado o
-  limite, `REJECTED` com `REFERENCE_NOT_FOUND`;
+  limite, `REJECTED` com `REFERENCE_NOT_FOUND`. Falhas operacionais do worker (nem transitórias nem
+  de negócio) entram em quarentena com backoff, sem consumir tentativas nem bloquear as demais
+  pendências;
 - SQS FIFO local (ElasticMQ), com provisionamento da fila `wager-events.fifo` e de sua DLQ.
 
 Ainda **não há** processamento de WIN e LOSS com referência e ROLLBACK (a API responde 501),
@@ -116,6 +118,13 @@ inválidos impedem a inicialização):
 | `PENDING_REFERENCE_MAX_DELAY_MS`     | `300000` | Teto da espera entre tentativas                          |
 
 Com os padrões, a rejeição por referência inexistente ocorre cerca de 18,5 min após a submissão.
+
+`PENDING_REFERENCE_BASE_DELAY_MS` e `PENDING_REFERENCE_MAX_DELAY_MS` também definem a quarentena de
+falhas operacionais (defeito, valor fora do armazenamento), contada em `processing_failures`,
+separada de `reference_attempts`. A quarentena não tem limite de ocorrências, nunca vira
+`REFERENCE_NOT_FOUND` e só aparece nos logs (`pending_reference_attempt_failed`,
+`pending_reference_defer_failed`). Uma política terminal (`FAILED`) ainda não foi decidida.
+
 Política e garantias: `ARCHITECTURE.md`, seção "Referências fora de ordem".
 
 ## Mensageria (SQS)

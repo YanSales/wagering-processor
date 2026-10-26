@@ -48,9 +48,23 @@ export class ReferenceRetryPolicy {
 
   /** Próxima tentativa após `completedAttempts` tentativas sem a referência (0 = submissão). */
   nextAttemptAt(completedAttempts: number, now: Date): Date {
+    return this.#after(completedAttempts, now);
+  }
+
+  /**
+   * Quarentena após uma falha operacional (nem transitória nem de negócio), dadas as falhas seguidas
+   * já registradas antes desta: a mesma progressão e o mesmo teto (2 s, 4 s… até 5 min no padrão),
+   * sem limite de ocorrências e sem consumir tentativas de resolução. Falha operacional não é
+   * evidência de que a referência não existe.
+   */
+  nextAttemptAfterFailure(previousFailures: number, now: Date): Date {
+    return this.#after(previousFailures, now);
+  }
+
+  #after(exponent: number, now: Date): Date {
     const { baseDelayMs, maxDelayMs } = this.settings;
     // O expoente é limitado antes da potência: o teto é atingido muito antes de 2^31.
-    const factor = 2 ** Math.min(completedAttempts, 31);
+    const factor = 2 ** Math.min(exponent, 31);
     return new Date(now.getTime() + Math.min(baseDelayMs * factor, maxDelayMs));
   }
 }

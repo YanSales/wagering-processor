@@ -27,6 +27,28 @@ describe('ReferenceRetryPolicy', () => {
     expect(delayAfter(policy, Number.MAX_SAFE_INTEGER)).toBe(300_000);
   });
 
+  test('quarentena operacional: mesma progressão e teto, sem limite de ocorrências', () => {
+    const policy = ReferenceRetryPolicy.from(DEFAULT_REFERENCE_RETRY);
+    const delays = Array.from(
+      { length: 15 },
+      (_, failures) =>
+        (policy.nextAttemptAfterFailure(failures, T0).getTime() - T0.getTime()) / 1_000,
+    );
+
+    expect(delays).toEqual([2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300, 300, 300, 300, 300]);
+    expect(policy.nextAttemptAfterFailure(Number.MAX_SAFE_INTEGER, T0).getTime()).toBe(
+      T0.getTime() + 300_000,
+    );
+  });
+
+  test('a quarentena usa a base e o teto configurados (as mesmas variáveis do reprocessamento)', () => {
+    const policy = ReferenceRetryPolicy.from({ maxAttempts: 1, baseDelayMs: 100, maxDelayMs: 350 });
+
+    expect(
+      [0, 1, 2, 3].map((f) => policy.nextAttemptAfterFailure(f, T0).getTime() - T0.getTime()),
+    ).toEqual([100, 200, 350, 350]);
+  });
+
   test('não altera a data recebida', () => {
     const now = new Date(T0.getTime());
     ReferenceRetryPolicy.from(DEFAULT_REFERENCE_RETRY).nextAttemptAt(0, now);

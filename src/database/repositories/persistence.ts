@@ -57,6 +57,7 @@ export function toTransactionRecord(
     resultBalanceCents: resultBalance === null ? null : resultBalance.cents,
     referenceAttempts: 0,
     nextReferenceAttemptAt: extras.nextReferenceAttemptAt ?? null,
+    processingFailures: 0,
     createdAt: transaction.createdAt,
     processedAt: transaction.processedAt ?? null,
   };

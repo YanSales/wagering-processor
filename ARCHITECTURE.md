@@ -334,8 +334,9 @@ submissão e o worker usam a mesma política.
   segunda encontra o estado já gravado (contada como `skipped`). Não há crédito duplo nem tentativa
   contada duas vezes;
 - falha transitória (`TransientPersistenceError`): tudo é desfeito, a tentativa não é consumida e a
-  transação volta na próxima rodada; nunca é confundida com referência inválida. Outras falhas
-  também desfazem tudo e são logadas com `transactionId` e `walletId`;
+  transação volta na próxima rodada; nunca é confundida com referência inválida. Falhas operacionais
+  também desfazem tudo, são logadas com `transactionId` e `walletId` e põem a transação em
+  quarentena (abaixo);
 - reinício: nenhum estado em memória; outra instância, ou a mesma reiniciada, continua pelo banco.
   No shutdown, o agendamento para e a rodada em andamento termina. O `MikroOrmCoreModule` é global, e
   o Nest encerra os módulos globais por último: o ORM fecha depois de o worker terminar a rodada.
@@ -345,18 +346,48 @@ submissão e o worker usam a mesma política.
 **Categorias de falha numa tentativa** (o §7.1 limita as tentativas pela **ausência da
 referência**; falhas operacionais não são referência inexistente):
 
-| Categoria                       | Exemplos                                                                                 | Tratamento atual                                                                                                |
-| ------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Referência ausente              | BET ainda não chegou                                                                     | nova tentativa com backoff; esgotado o limite, `REJECTED` com `REFERENCE_NOT_FOUND`                             |
-| Referência existente e inválida | outra rodada, valor, BET `REJECTED`, já reembolsada                                      | `REJECTED` imediato, com o código da violação                                                                   |
-| Transitória                     | conexão, deadlock, serialização, servidor indisponível (`isTransientPersistenceFailure`) | tudo desfeito; a tentativa não é consumida; volta na rodada seguinte                                            |
-| Permanente ou desconhecida      | defeito de código, saldo acima do `bigint` no crédito                                    | tudo desfeito e logado; tentada de novo a cada rodada, sem consumir tentativa e sem virar `REFERENCE_NOT_FOUND` |
+| Categoria                                | Exemplos                                                                                 | Tratamento atual                                                                                                            |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Referência ausente                       | BET ainda não chegou                                                                     | nova tentativa com backoff; esgotado o limite, `REJECTED` com `REFERENCE_NOT_FOUND`                                         |
+| Referência existente e inválida          | outra rodada, valor, BET `REJECTED`, já reembolsada                                      | `REJECTED` imediato, com o código da violação                                                                               |
+| Transitória                              | conexão, deadlock, serialização, servidor indisponível (`isTransientPersistenceFailure`) | tudo desfeito; a tentativa não é consumida; volta na rodada seguinte                                                        |
+| Operacional (permanente ou desconhecida) | defeito de código, saldo acima do `bigint` no crédito                                    | tudo desfeito e logado; depois, **quarentena** com backoff (abaixo); nunca consome tentativa nem vira `REFERENCE_NOT_FOUND` |
 
-A última categoria não tem saída terminal: uma linha assim fica em `PENDING_REFERENCE`
-indefinidamente. Como ela continua vencida e a busca começa pelas mais antigas, 50 ou mais linhas
-nessa situação (o tamanho do lote) ocupariam todas as rodadas e impediriam o processamento das
-demais. Nenhum caminho conhecido produz essa falha hoje: o estouro exige saldo perto de
-9,2×10¹⁶. O tratamento (`FAILED`, quarentena ou adiamento com alerta) é uma decisão pendente.
+**Quarentena de falhas operacionais** (decisão aprovada, opção B; migration
+`Migration20261026114119_worker_processing_failures`, aditiva e reversível, sem pré-condição):
+
+- a coluna `processing_failures` (`int not null default 0`) conta as falhas operacionais seguidas.
+  Ela é separada de `reference_attempts`, que continua contando só as tentativas de resolução e é o
+  único contador do limite do §7.1. Os `CHECK`s garantem `processing_failures >= 0` e valor
+  diferente de zero só em `PENDING_REFERENCE`;
+- depois do rollback da tentativa que falhou, uma transação própria (`deferAfterFailure`) faz
+  `SELECT … FOR UPDATE` da linha. Ela só segue se a linha ainda estiver em `PENDING_REFERENCE` e
+  vencida no instante da tentativa. Então incrementa o contador e adia a próxima tentativa com a
+  **mesma** progressão e o mesmo teto da política, reutilizando `PENDING_REFERENCE_BASE_DELAY_MS` e
+  `PENDING_REFERENCE_MAX_DELAY_MS` (2, 4, 8… até 300 s), sem limite de ocorrências;
+- o adiamento trava só a linha da transação e nenhum lock depois dela, então não forma ciclo com a
+  tentativa (wallet, depois transação). Uma transição concluída ou outro adiamento concorrente fazem
+  as condições falharem, e nada é sobrescrito. Mesmo sem essa guarda, os `CHECK`s impediriam
+  agendamento ou contador numa linha terminal;
+- uma falha ao gravar o adiamento só é relatada (`pending_reference_defer_failed`, `deferFailures`).
+  A linha continua vencida, e a rodada segue com as demais;
+- falhas transitórias **não** entram em quarentena nem incrementam o contador;
+- uma tentativa concluída (`PROCESSED`, `REJECTED` ou reagendada pela ausência da referência) zera o
+  contador **no mesmo `UPDATE` da transição**. O histórico só some com o commit dela;
+- efeito: uma linha com defeito sai das rodadas seguintes até vencer a quarentena, e as saudáveis
+  avançam (teste com 55 linhas com defeito e lote de 50). Corrigida a causa, a linha resolve sozinha
+  na próxima tentativa.
+
+**Limite da quarentena — decisão pendente.** Não há saída terminal para falha operacional: uma linha
+cujo defeito persiste fica em `PENDING_REFERENCE` indefinidamente, tentada no máximo a cada 5 min,
+e só os logs a sinalizam (não há métrica nem alerta). O contrato define `FAILED` como "erro
+permanente de infraestrutura (terminal, auditável)" (§6.3), mas não diz quando uma falha
+desconhecida passa a ser permanente. Tornar o REFUND terminal impediria o reembolso mesmo depois de
+uma correção, então a política (limite K, código, HTTP e procedimento manual) foi adiada.
+
+Achado latente para essa decisão: o controller responde 200 para qualquer status que não seja
+`REJECTED` nem `PENDING_REFERENCE`, então um `FAILED` responderia 200. Hoje isso é inalcançável,
+porque a persistência recusa gravar `FAILED` (`assertDecision`).
 
 **HTTP e idempotência.** Pendente → 202 com `{ status: "PENDING_REFERENCE", balance }` (saldo
 observado ao aceitar). O reenvio devolve o estado atual gravado: 202 enquanto pendente; depois, o
@@ -381,9 +412,56 @@ eventos ainda; os eventos entram todos juntos com a Outbox transacional.
 - REFUND e BET simultâneos;
 - 20 reenvios simultâneos e o replay depois da resolução;
 - falha transitória sem consumir a tentativa;
-- falha no meio da tentativa desfazendo transação, wallet e ledger;
+- falha no meio da tentativa desfazendo transação, wallet e ledger, seguida da quarentena e da
+  resolução depois de vencida;
 - reinício com outra instância do ORM;
 - reconciliação.
+
+A quarentena tem testes próprios, em
+`test/integration/pending-reference-quarantine.integration.test.ts`:
+
+- o backoff persistido;
+- 15 falhas seguidas sem `REFERENCE_NOT_FOUND` e sem consumir tentativas;
+- a recuperação depois de corrigida a causa, com o contador zerado, tanto com a BET quanto sem ela;
+- a starvation, com 55 linhas com defeito e 3 saudáveis;
+- a falha transitória sem quarentena;
+- a falha ao gravar o adiamento;
+- o adiamento que não sobrescreve uma linha concluída nem uma não vencida, em execução sequencial;
+- as corridas com o adiamento, em ordem controlada (abaixo);
+- o replay de uma linha em quarentena (`PENDING_REFERENCE`);
+- os `CHECK`s e a reconciliação.
+
+**Corridas em ordem controlada** (substituem um teste anterior com 3 pools, que dependia de timing):
+
+- uma transação de teste trava a linha (`SELECT … FOR UPDATE`, sem escrever nada) e dois
+  participantes reais, em pools separados, são enfileirados atrás dela: o resolver
+  (`ReprocessPendingReferences`) e/ou o adiamento (`deferAfterFailure`);
+- antes de liberar a linha, o teste **verifica a ordem no PostgreSQL**, em vez de supô-la:
+  - por `pg_stat_activity`, cada participante está esperando um lock (identificado pela consulta);
+  - por `pg_blocking_pids`, o primeiro é bloqueado pela transação de teste, e o segundo é bloqueado
+    pelo **primeiro**, e não o contrário (quem está à frente segura o lock da tupla);
+- a espera por cada participante é condicionada: a mesma consulta se repete a cada 10 ms, até 5 s;
+  o intervalo não sincroniza nada.
+
+| Cenário | Ordem                                    | Resultado verificado                                                                                                         |
+| ------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| A       | resolver, depois adiamento               | `PROCESSED` com um crédito; o adiamento devolve `false` e não altera o registro                                              |
+| B       | resolver (BET ausente), depois adiamento | o resolver reagenda (data + 4 s, 1 tentativa); o adiamento devolve `false` e não toca na data nem no contador                |
+| C       | adiamento, depois resolver               | contador 1 e data + 2 s; o resolver encontra a linha não vencida (`skipped`): nenhuma tentativa consumida, nenhum lançamento |
+| D       | dois adiamentos                          | `[true, false]`: só o primeiro altera o registro                                                                             |
+
+Os quatro passaram em 10 execuções seguidas. Limite: a ordem é imposta pela fila de locks do
+PostgreSQL, e o teste a observa de fora; não há pontos de sincronização no código de produção.
+
+Mutações conferidas:
+
+- sem a quarentena, 7 testes falham, entre eles o de starvation;
+- sem a guarda de elegibilidade do adiamento (status e vencimento), A, B e D falham. Em A, o `CHECK`
+  de agendamento recusa a escrita na linha `PROCESSED`, a última barreira;
+- sem só a guarda de vencimento do adiamento, B e D falham;
+- sem a guarda de vencimento do resolver, C falha;
+- com quarentena também em falhas transitórias, os testes de integração e unitário da falha
+  transitória falham.
 
 Por HTTP, há 202, 200, 422 e o worker da própria aplicação resolvendo a pendência. Mutações
 conferidas:
@@ -396,7 +474,11 @@ conferidas:
 
 - A pendência não é antecipada quando a BET chega: ela espera o próximo vencimento, que, depois de
   algumas tentativas, pode estar a até 5 min.
-- Uma falha não transitória e repetível pode bloquear a fila (tabela acima).
+- Falha operacional persistente: a quarentena impede que a linha bloqueie a fila, mas não a encerra.
+  `FAILED` é uma decisão pendente (acima).
+- Falha transitória **específica de uma linha** (ex.: deadlock repetido só com ela) continua sem
+  quarentena e é retentada a cada rodada. Isso é intencional, para não confundir ambiente com
+  defeito.
 - Várias instâncias leem as mesmas linhas vencidas e esperam umas pelas outras no lock da wallet.
   O resultado continua correto, mas há trabalho repetido; seria possível evitá-lo com
   `SKIP LOCKED`.
@@ -506,4 +588,6 @@ unidos por vírgula e é aceito como uma única chave.
 WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), eventos de `PENDING_REFERENCE` e do
 esgotamento (§7.1 e §11, com a Outbox), Inbox/Outbox, consumo SQS, retry e DLQ (§6.5, §10 e §11),
 consultas e reconciliação pela API (`GET /wallets/:id`, ledger, transações), autenticação real
-(§2), observabilidade (§12: métricas) e `GET /health/ready`.
+(§2), observabilidade (§12: métricas) e `GET /health/ready`. Política terminal (`FAILED`) para falhas
+operacionais persistentes do worker: decisão pendente (hoje, quarentena sem fim). Enquanto os eventos
+não forem publicados, o contrato não está completo.

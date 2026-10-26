@@ -70,10 +70,13 @@ export const PENDING_REFERENCE_SETTINGS = Symbol('PENDING_REFERENCE_SETTINGS');
           batchSize: settings.batchSize,
           policy: ReferenceRetryPolicy.from(settings.retry),
           // Só identificadores e o tipo do erro (§12): nada de valores nem payloads.
-          onError: (task, error) =>
+          onError: (task, error, stage) =>
             logger.error(
               JSON.stringify({
-                event: 'pending_reference_attempt_failed',
+                event:
+                  stage === 'attempt'
+                    ? 'pending_reference_attempt_failed'
+                    : 'pending_reference_defer_failed',
                 transactionId: task.transactionId,
                 walletId: task.walletId,
                 error: error instanceof Error ? error.name : 'unknown',

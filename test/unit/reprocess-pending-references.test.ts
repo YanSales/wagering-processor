@@ -4,7 +4,10 @@ import {
   DEFAULT_REFERENCE_RETRY,
   ReferenceRetryPolicy,
 } from '../../src/application/reference-retry-policy';
-import { ReprocessPendingReferences } from '../../src/application/reprocess-pending-references';
+import {
+  type ReprocessFailureStage,
+  ReprocessPendingReferences,
+} from '../../src/application/reprocess-pending-references';
 import {
   type PendingReferenceRepository,
   type PendingReferenceState,
@@ -58,12 +61,34 @@ type Behavior =
   | { kind: 'skip' }
   | { kind: 'throw'; error: unknown };
 
-/** Porta falsa: entrega estados prontos e guarda as decisões recebidas. */
+/** Resultado de um adiamento na porta falsa: gravado, nada a adiar ou falha. */
+type DeferBehavior = { previousFailures: number; result: boolean } | { error: unknown };
+
+/** Porta falsa: entrega estados prontos e guarda as decisões e os adiamentos recebidos. */
 class FakePending implements PendingReferenceRepository {
   readonly decisions: SubmissionDecision[] = [];
   readonly seen: { now: Date; limit: number }[] = [];
+  readonly defers: { transactionId: string; now: Date; next: Date }[] = [];
 
-  constructor(private readonly behaviors: Map<string, Behavior>) {}
+  constructor(
+    private readonly behaviors: Map<string, Behavior>,
+    private readonly deferBehaviors = new Map<string, DeferBehavior>(),
+  ) {}
+
+  async deferAfterFailure(
+    task: PendingReferenceTask,
+    now: Date,
+    nextAttemptAt: (previousFailures: number) => Date,
+  ): Promise<boolean> {
+    const behavior = this.deferBehaviors.get(task.transactionId) ?? {
+      previousFailures: 0,
+      result: true,
+    };
+    if ('error' in behavior) throw behavior.error;
+    const next = nextAttemptAt(behavior.previousFailures);
+    this.defers.push({ transactionId: task.transactionId, now, next });
+    return behavior.result;
+  }
 
   async findDuePendingReferences(now: Date, limit: number): Promise<PendingReferenceTask[]> {
     this.seen.push({ now, limit });
@@ -92,8 +117,12 @@ const stateWith = (
   state: () => ({ transaction, wallet: wallet(), reference, completedAttempts }),
 });
 
-function run(behaviors: [string, Behavior][], onError?: (t: PendingReferenceTask) => void) {
-  const pending = new FakePending(new Map(behaviors));
+function run(
+  behaviors: [string, Behavior][],
+  onError?: (t: PendingReferenceTask, error: unknown, stage: ReprocessFailureStage) => void,
+  deferBehaviors: [string, DeferBehavior][] = [],
+) {
+  const pending = new FakePending(new Map(behaviors), new Map(deferBehaviors));
   const reprocess = new ReprocessPendingReferences(pending, {
     batchSize: 25,
     now: () => at(100),
@@ -125,7 +154,11 @@ describe('ReprocessPendingReferences', () => {
       skipped: 1,
       transientFailures: 0,
       failures: 0,
+      deferred: 0,
+      deferFailures: 0,
     });
+    // Resultados de negócio (inclusive o esgotamento) não passam pela quarentena.
+    expect(pending.defers).toEqual([]);
     expect(pending.seen).toEqual([{ now: at(100), limit: 25 }]);
     const [resolved, waiting, exhausted] = pending.decisions;
     expect(resolved?.transaction.status).toBe(WagerTransactionStatus.Processed);
@@ -135,9 +168,9 @@ describe('ReprocessPendingReferences', () => {
     expect(exhausted?.transaction.failureCode).toBe(FailureCodes.ReferenceNotFound);
   });
 
-  test('falha transitória: contada, sem onError; a rodada segue com as demais', async () => {
+  test('falha transitória: contada, sem onError nem quarentena; a rodada segue com as demais', async () => {
     const errors: PendingReferenceTask[] = [];
-    const { summary } = run(
+    const { pending, summary } = run(
       [
         [
           'flaky',
@@ -148,22 +181,85 @@ describe('ReprocessPendingReferences', () => {
       (task) => errors.push(task),
     );
 
-    expect(await summary).toMatchObject({ transientFailures: 1, rescheduled: 1, failures: 0 });
+    expect(await summary).toMatchObject({
+      transientFailures: 1,
+      rescheduled: 1,
+      failures: 0,
+      deferred: 0,
+    });
     expect(errors).toEqual([]);
+    expect(pending.defers).toEqual([]);
   });
 
-  test('falha inesperada: relatada a onError com a tarefa; a rodada segue', async () => {
-    const errors: PendingReferenceTask[] = [];
+  test('falha inesperada: relatada, depois quarentena com o backoff da política; a rodada segue', async () => {
+    const errors: [string, ReprocessFailureStage][] = [];
+    const { pending, summary } = run(
+      [
+        ['broken', { kind: 'throw', error: new Error('bug') }],
+        ['broken-again', { kind: 'throw', error: new RangeError('fora da faixa') }],
+        ['waiting', stateWith(pendingRefund('waiting'), 0)],
+      ],
+      (task, _error, stage) => errors.push([task.transactionId, stage]),
+      [['broken-again', { previousFailures: 3, result: true }]],
+    );
+
+    expect(await summary).toMatchObject({
+      failures: 2,
+      deferred: 2,
+      deferFailures: 0,
+      rescheduled: 1,
+    });
+    expect(errors).toEqual([
+      ['broken', 'attempt'],
+      ['broken-again', 'attempt'],
+    ]);
+    // Primeira falha: 2 s; com 3 falhas anteriores: 2 s × 2^3 = 16 s. Contados do instante da tentativa.
+    expect(pending.defers).toEqual([
+      { transactionId: 'broken', now: at(100), next: at(102) },
+      { transactionId: 'broken-again', now: at(100), next: at(116) },
+    ]);
+  });
+
+  test('quarentena com muitas falhas anteriores respeita o teto (5 min)', async () => {
+    const { pending, summary } = run(
+      [['broken', { kind: 'throw', error: new Error('bug') }]],
+      undefined,
+      [['broken', { previousFailures: 50, result: true }]],
+    );
+    await summary;
+
+    expect(pending.defers[0]?.next.getTime()).toBe(at(400).getTime());
+  });
+
+  test('nada a adiar (concluída ou adiada por outro worker): não conta como adiada', async () => {
+    const { summary } = run([['broken', { kind: 'throw', error: new Error('bug') }]], undefined, [
+      ['broken', { previousFailures: 0, result: false }],
+    ]);
+
+    expect(await summary).toMatchObject({ failures: 1, deferred: 0, deferFailures: 0 });
+  });
+
+  test('falha ao gravar a quarentena: relatada como defer, sem interromper a rodada', async () => {
+    const errors: [string, ReprocessFailureStage][] = [];
     const { summary } = run(
       [
         ['broken', { kind: 'throw', error: new Error('bug') }],
         ['waiting', stateWith(pendingRefund('waiting'), 0)],
       ],
-      (task) => errors.push(task),
+      (task, _error, stage) => errors.push([task.transactionId, stage]),
+      [['broken', { error: new TransientPersistenceError({ cause: new Error('x') }) }]],
     );
 
-    expect(await summary).toMatchObject({ failures: 1, rescheduled: 1 });
-    expect(errors).toEqual([{ transactionId: 'broken', walletId: 'wallet-1' }]);
+    expect(await summary).toMatchObject({
+      failures: 1,
+      deferred: 0,
+      deferFailures: 1,
+      rescheduled: 1,
+    });
+    expect(errors).toEqual([
+      ['broken', 'attempt'],
+      ['broken', 'defer'],
+    ]);
   });
 
   test('pendência de outro tipo não tem reprocessamento: falha, nada é decidido', async () => {
@@ -182,6 +278,7 @@ describe('ReprocessPendingReferences', () => {
           throw new TransientPersistenceError({ cause: new Error('x') });
         },
         resolvePendingReference: async () => false,
+        deferAfterFailure: async () => false,
       },
       { batchSize: 1 },
     );

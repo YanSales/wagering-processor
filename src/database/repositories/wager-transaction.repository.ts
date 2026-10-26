@@ -175,6 +175,8 @@ export class MikroOrmWagerTransactionRepository
             processedAt: transaction.processedAt ?? null,
             referenceAttempts: pendingRow.reference_attempts + 1,
             nextReferenceAttemptAt: decision.nextReferenceAttemptAt ?? null,
+            // Tentativa concluída: a quarentena termina no mesmo commit da transição.
+            processingFailures: 0,
           },
         );
         if (updated !== 1) {
@@ -184,6 +186,40 @@ export class MikroOrmWagerTransactionRepository
         }
         if (ledgerEntry !== null) await applyMovement(em, row, wallet, ledgerEntry);
         return true;
+      }),
+    );
+  }
+
+  deferAfterFailure(
+    task: PendingReferenceTask,
+    now: Date,
+    nextAttemptAt: (previousFailures: number) => Date,
+  ): Promise<boolean> {
+    return classifyFailures(() =>
+      this.orm.em.fork().transactional(async (em) => {
+        // Só a linha da transação é travada, e nenhum outro lock é pedido depois dela: não há ciclo
+        // com a tentativa (wallet → transação). Uma tentativa concorrente que já tenha concluído ou
+        // reagendado a linha faz as condições falharem, e nada é sobrescrito.
+        const [row] = (await em.getConnection().execute(
+          `select processing_failures from wager_transactions
+            where id = ? and wallet_id = ? and status = 'PENDING_REFERENCE'
+              and next_reference_attempt_at <= ?
+              for update`,
+          [task.transactionId, task.walletId, now],
+          'all',
+          em.getTransactionContext(),
+        )) as { processing_failures: number }[];
+        if (row === undefined) return false;
+
+        const updated = await em.nativeUpdate(
+          WagerTransactionRecord,
+          { id: task.transactionId, status: WagerTransactionStatus.PendingReference },
+          {
+            processingFailures: row.processing_failures + 1,
+            nextReferenceAttemptAt: nextAttemptAt(row.processing_failures),
+          },
+        );
+        return updated === 1;
       }),
     );
   }

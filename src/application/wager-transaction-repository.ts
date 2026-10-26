@@ -125,6 +125,8 @@ export interface PendingReferenceRepository {
    * transação (tentativa contada), saldo, versão e lançamento juntos. A decisão pode ser `PROCESSED`,
    * `REJECTED` ou de novo `PENDING_REFERENCE`, com a próxima tentativa.
    *
+   * A transição gravada zera `processingFailures`: a quarentena termina junto com o commit dela.
+   *
    * Devolve `false` se não havia nada a fazer. Falhas desfazem tudo, sem consumir a tentativa;
    * transitórias viram `TransientPersistenceError`.
    */
@@ -132,6 +134,20 @@ export interface PendingReferenceRepository {
     task: PendingReferenceTask,
     now: Date,
     decide: (state: PendingReferenceState) => SubmissionDecision,
+  ): Promise<boolean>;
+
+  /**
+   * Quarentena após uma falha operacional, numa transação própria, depois do rollback da tentativa:
+   * só se a transação ainda estiver em `PENDING_REFERENCE` e vencida em `now` (uma transição ou um
+   * adiamento concorrentes vencem), incrementa `processingFailures` e agenda a próxima tentativa em
+   * `nextAttemptAt(falhas anteriores)`. Não toca nas tentativas de resolução nem no estado.
+   *
+   * Devolve `false` se não havia o que adiar; transitórias viram `TransientPersistenceError`.
+   */
+  deferAfterFailure(
+    task: PendingReferenceTask,
+    now: Date,
+    nextAttemptAt: (previousFailures: number) => Date,
   ): Promise<boolean>;
 }
 

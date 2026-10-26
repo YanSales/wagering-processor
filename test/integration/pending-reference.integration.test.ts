@@ -106,6 +106,7 @@ function scoped(target: MikroORM, walletIds: string[]): PendingReferenceReposito
       return due.filter((t) => walletIds.includes(t.walletId)).slice(0, limit);
     },
     resolvePendingReference: (task, now, decide) => real.resolvePendingReference(task, now, decide),
+    deferAfterFailure: (task, now, next) => real.deferAfterFailure(task, now, next),
   };
 }
 
@@ -131,6 +132,7 @@ async function row(idempotencyKey: string) {
     status: string;
     failure_code: string | null;
     attempts: number;
+    processing_failures: number;
     next_ms: string | null;
     created_ms: string;
     reference_id: string | null;
@@ -138,7 +140,7 @@ async function row(idempotencyKey: string) {
     processed: boolean;
     entries: number;
   }>(
-    `select t.id, t.status, t.failure_code, t.reference_attempts as attempts,
+    `select t.id, t.status, t.failure_code, t.reference_attempts as attempts, t.processing_failures,
             (extract(epoch from t.next_reference_attempt_at) * 1000)::bigint::text as next_ms,
             (extract(epoch from t.created_at) * 1000)::bigint::text as created_ms,
             t.reference_transaction_id as reference_id,
@@ -582,6 +584,7 @@ describe('PENDING_REFERENCE: concorrência, falhas e recuperação', () => {
           decide(state);
           throw Object.assign(new Error('deadlock simulado'), { code: '40P01' });
         }),
+      deferAfterFailure: real.deferAfterFailure,
     };
 
     const summary = await new ReprocessPendingReferences(flaky, {
@@ -622,12 +625,21 @@ describe('PENDING_REFERENCE: concorrência, falhas e recuperação', () => {
       onError: (task) => failures.push(task),
     }).runOnce();
 
-    expect(summary).toMatchObject({ due: 1, failures: 1, processed: 0 });
+    expect(summary).toMatchObject({ due: 1, failures: 1, processed: 0, deferred: 1 });
     expect(failures).toEqual([{ transactionId: before.id, walletId: wallet.walletId }]);
-    expect(await row(refund.idempotencyKey)).toEqual(before);
+    // A tentativa foi desfeita inteira; só a quarentena, gravada depois do rollback, mudou a linha.
+    const after = await row(refund.idempotencyKey);
+    expect({ ...after, processing_failures: 0, next_ms: before.next_ms }).toEqual(before);
+    expect(after.processing_failures).toBe(1);
     expect(await walletState(wallet.walletId)).toEqual(beforeWallet);
 
-    expect((await worker([wallet.walletId]).runOnce()).processed).toBe(1);
+    // Vencida a quarentena, a causa (o id repetido) não existe mais: resolve e zera o contador.
+    expect((await worker([wallet.walletId], { now: ahead(60_000) }).runOnce()).processed).toBe(1);
+    expect(await row(refund.idempotencyKey)).toMatchObject({
+      status: Processed,
+      attempts: 1,
+      processing_failures: 0,
+    });
     expect(await walletState(wallet.walletId)).toMatchObject({
       balance: '10000',
       rebuilt: '10000',

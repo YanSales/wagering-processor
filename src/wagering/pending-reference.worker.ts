@@ -74,8 +74,9 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnApplica
     // Sem valores monetários nem payloads: só contagens (§12).
     if (summary.due === 0) return;
     const message = JSON.stringify({ event: 'pending_reference_round', ...summary });
-    if (summary.failures > 0 || summary.transientFailures > 0) this.logger.warn(message);
-    else this.logger.log(message);
+    if (summary.failures > 0 || summary.transientFailures > 0 || summary.deferFailures > 0) {
+      this.logger.warn(message);
+    } else this.logger.log(message);
   }
 
   #reportFailure(error: unknown): void {

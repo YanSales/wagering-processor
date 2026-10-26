@@ -31,6 +31,12 @@ export class WagerTransactionRecord {
   referenceAttempts!: number;
   /** Próxima tentativa de resolução; preenchida somente em `PENDING_REFERENCE`. */
   nextReferenceAttemptAt!: Date | null;
+  /**
+   * Falhas operacionais seguidas (nem transitórias nem de negócio) nas tentativas do worker: definem
+   * a quarentena com backoff. Não contam como tentativa de resolução (`referenceAttempts`) e voltam a
+   * zero quando uma tentativa é concluída.
+   */
+  processingFailures!: number;
   createdAt!: Date;
   processedAt!: Date | null;
 }
@@ -62,6 +68,8 @@ const SUBMISSION_COLUMNS = [
  * - submissão concluída (`PROCESSED`/`REJECTED`) guarda o saldo observado, não negativo.
  * - `PENDING_REFERENCE` (§7, regra 8) existe somente com referência externa e próxima tentativa
  *   agendada; nenhum outro estado tem tentativa agendada. O índice parcial atende a busca do worker.
+ * - `processing_failures` (quarentena de falhas operacionais do worker) não é negativo e só é
+ *   diferente de zero em `PENDING_REFERENCE`.
  */
 export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
   class: WagerTransactionRecord,
@@ -99,6 +107,7 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     resultBalanceCents: { type: new BigIntType('bigint'), nullable: true },
     referenceAttempts: { type: 'integer', default: 0 },
     nextReferenceAttemptAt: { type: 'timestamptz', nullable: true },
+    processingFailures: { type: 'integer', default: 0 },
     createdAt: { type: 'timestamptz' },
     processedAt: { type: 'timestamptz', nullable: true },
   },
@@ -159,6 +168,15 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
         "(status = 'PENDING_REFERENCE' and next_reference_attempt_at is not null " +
         'and reference_external_transaction_id is not null) or ' +
         "(status <> 'PENDING_REFERENCE' and next_reference_attempt_at is null)",
+    },
+    {
+      name: 'wager_transactions_processing_failures_check',
+      expression: 'processing_failures >= 0',
+    },
+    {
+      // A quarentena só existe enquanto se aguarda a referência; a transição a zera.
+      name: 'wager_transactions_processing_failures_pending_check',
+      expression: "status = 'PENDING_REFERENCE' or processing_failures = 0",
     },
   ],
   indexes: [

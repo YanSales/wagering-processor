@@ -236,6 +236,23 @@
           "enumItems": [],
           "mappedType": "datetime"
         },
+        "processing_failures": {
+          "name": "processing_failures",
+          "type": "int",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "0",
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
         "provider_id": {
           "name": "provider_id",
           "type": "text",
@@ -472,6 +489,16 @@
           "name": "wager_transactions_pending_reference_schedule_check",
           "expression": "(status = 'PENDING_REFERENCE' and next_reference_attempt_at is not null and reference_external_transaction_id is not null) or (status <> 'PENDING_REFERENCE' and next_reference_attempt_at is null)",
           "definition": "check ((status = 'PENDING_REFERENCE' and next_reference_attempt_at is not null and reference_external_transaction_id is not null) or (status <> 'PENDING_REFERENCE' and next_reference_attempt_at is null))"
+        },
+        {
+          "name": "wager_transactions_processing_failures_check",
+          "expression": "processing_failures >= 0",
+          "definition": "check (processing_failures >= 0)"
+        },
+        {
+          "name": "wager_transactions_processing_failures_pending_check",
+          "expression": "status = 'PENDING_REFERENCE' or processing_failures = 0",
+          "definition": "check (status = 'PENDING_REFERENCE' or processing_failures = 0)"
         },
         {
           "name": "wager_transactions_reference_attempts_check",

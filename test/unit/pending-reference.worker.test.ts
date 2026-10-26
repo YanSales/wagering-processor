@@ -17,6 +17,8 @@ const EMPTY: ReprocessSummary = {
   skipped: 0,
   transientFailures: 0,
   failures: 0,
+  deferred: 0,
+  deferFailures: 0,
 };
 
 /** Rodadas falsas: conta chamadas e devolve o que `next` produzir. */
@@ -152,6 +154,26 @@ describe('PendingReferenceWorker', () => {
 
     // Rodadas com sucesso e com falha, ambas com log falhando, e o agendamento seguiu.
     expect(calls.count).toBeGreaterThan(3);
+  });
+
+  test('falha ao gravar a quarentena sobe o log da rodada para warn', async () => {
+    const { logger, lines } = recordingLogger();
+    const { reprocess } = reprocessing(async () => ({
+      ...EMPTY,
+      due: 1,
+      failures: 1,
+      deferFailures: 1,
+    }));
+    const worker = new PendingReferenceWorker(
+      reprocess,
+      { enabled: false, pollIntervalMs: 1 },
+      logger,
+    );
+
+    await worker.runOnce();
+
+    expect(lines.map((l) => l.level)).toEqual(['warn']);
+    expect(JSON.parse(lines[0]?.message ?? '')).toMatchObject({ deferFailures: 1, failures: 1 });
   });
 
   test('log da rodada: só contagens, e só quando havia algo vencido', async () => {
