@@ -810,10 +810,18 @@ inválida, ROLLBACK antes da BET resolvido pelo worker e reconciliação consist
 - **REFUND e ROLLBACK da mesma BET**: a regra 4 proíbe reverter duas vezes "pelo mesmo tipo"; o
   schema e o processamento seguem a letra e aceitam um REFUND e um ROLLBACK da mesma BET (dois
   créditos). Se o contrato quiser uma reversão por referência, qualquer tipo, falta a regra.
-- **WIN com referência**: o contrato diz só que a WIN "pode" referenciar a BET da mesma rodada. Não
-  define se a BET precisa estar `PROCESSED`, nem se uma BET ausente leva a WIN a esperar
-  (`PENDING_REFERENCE`, regra 8) ou a rejeita. Continua recusada (`UNSUPPORTED_SUBMISSION`).
-- **LOSS com referência**: o contrato não tem regra. Continua recusada.
+- **WIN com referência**: o texto do contrato (§7, tabela) é só "pode referenciar a `BET` da mesma
+  rodada"; a regra 2 exige mesmo provider, player, wallet, moeda e rodada, e a regra 3 não cita a
+  WIN. Não define se a BET precisa estar `PROCESSED` (o "`PROCESSED`, valor igual" da tabela é das
+  reversões), se o valor importa, nem se uma BET ausente leva a WIN a esperar (`PENDING_REFERENCE`,
+  regra 8) ou a rejeita. WIN **sem** referência é processada normalmente.
+- **LOSS com referência**: a tabela diz só "registra o resultado sem mover saldo"; nenhuma regra
+  permite ou proíbe referência em LOSS. LOSS **sem** referência é processada normalmente.
+- **Efeito enquanto não houver decisão**: WIN e LOSS com `referenceExternalTransactionId` são
+  recusadas sem gravar nada (`UNSUPPORTED_SUBMISSION`: HTTP 501; pela fila, DLQ com esse motivo,
+  para reprocessar depois da decisão). Nenhuma regra financeira foi inventada. O domínio já valida a
+  forma da referência de uma WIN (`validateReference`: BET da mesma rodada, player, wallet e moeda);
+  falta decidir status, valor e espera.
 
 ## Consultas e reconciliação (contrato §9)
 
@@ -864,6 +872,27 @@ métricas".
 SQS não exigido quando desligado, métricas com o banco falhando), `test/integration/health.integration.test.ts`
 (HTTP real: live, ready, métricas atualizadas por uma BET e um replay; pool encerrado → 503 com live
 200) e `test/sqs/readiness.sqs.test.ts` (filas existentes → `up` e DLQ medida; fila inexistente → `down`).
+
+## Cobertura dos testes obrigatórios (contrato §13)
+
+| §13                                            | Teste (PostgreSQL e ElasticMQ reais)                                                   |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Mesma aposta 50 vezes em paralelo → um débito  | `bet-processing`: 50 submissões idênticas em **3 processos** Bun (`bet-worker.ts`)     |
+| Saldo disputado (cenário do §8)                | `bet-processing` (2 processos), HTTP; e via SQS em `instances.sqs` (3 instâncias)      |
+| Wallets distintas em paralelo                  | `bet-processing`, `outbox`, `instances.sqs`                                            |
+| ≥ 3 processos/instâncias simultâneos           | `bet-processing` (BETs diretas) e `instances.sqs`: **3 processos** com consumidor real |
+| Worker morto depois do commit e antes do ack   | `instances.sqs`: instância morta com SIGKILL após o commit; reentrega para na Inbox    |
+| Dois publishers sobre a mesma outbox           | `outbox-publisher` (dois pools)                                                        |
+| ROLLBACK ou REFUND antes da referência         | `pending-reference`, `rollback-processing` e `instances.sqs` (REFUND antes da BET)     |
+| Reinício com comprovação da consistência final | `instances.sqs`: nova instância conclui consumo, `PENDING_REFERENCE` e publicação      |
+| Invariante `wallet.balance == ledger`          | todos os cenários acima, por reconciliação ou soma do ledger                           |
+
+**Instâncias reais**: `test/support/instance-worker.ts` roda, num processo Bun próprio (pool e
+cliente SQS próprios), os mesmos componentes da aplicação — consumidor, worker de
+`PENDING_REFERENCE` e publisher da outbox — sobre o PostgreSQL de teste e o emulador. As filas
+efêmeras usam a definição versionada com visibilidade de 3 s, para que a reentrega depois da queda
+aconteça em segundos. Limitações: as instâncias são processos do mesmo host, não containers; o
+servidor HTTP não sobe nesses processos (a API é coberta pelos testes HTTP em processo).
 
 ## Decisões, trade-offs e limitações (contrato §14)
 

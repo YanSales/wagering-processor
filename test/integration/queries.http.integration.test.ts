@@ -204,25 +204,33 @@ describe('POST /wallets/:walletId/reconciliation', () => {
 
   test('divergência é sinalizada, sem corrigir a wallet; inexistente: 404', async () => {
     const wallet = await openWallet('50.00');
-    // Divergência forçada no banco de teste: o saldo muda sem lançamento.
+    // Divergência forçada no banco de teste: o saldo muda sem lançamento. Desfeita ao
+    // final, para não deixar no banco compartilhado uma wallet que viole a invariante do §13.
     await orm.em
       .getConnection()
       .execute('update wallets set balance_cents = balance_cents + 150 where id = ?', [wallet.id]);
+    try {
+      const response = await fetch(`${baseUrl}/wallets/${wallet.id}/reconciliation`, {
+        method: 'POST',
+      });
 
-    const response = await fetch(`${baseUrl}/wallets/${wallet.id}/reconciliation`, {
-      method: 'POST',
-    });
-
-    expect(await json(response)).toMatchObject({
-      storedBalance: { amount: '51.50', currency: 'BRL' },
-      calculatedBalance: { amount: '50.00', currency: 'BRL' },
-      difference: { amount: '1.50', currency: 'BRL' },
-      consistent: false,
-    });
-    // Nada foi corrigido.
-    expect(await json(await get(`/wallets/${wallet.id}`))).toMatchObject({
-      balance: { amount: '51.50', currency: 'BRL' },
-    });
+      expect(await json(response)).toMatchObject({
+        storedBalance: { amount: '51.50', currency: 'BRL' },
+        calculatedBalance: { amount: '50.00', currency: 'BRL' },
+        difference: { amount: '1.50', currency: 'BRL' },
+        consistent: false,
+      });
+      // Nada foi corrigido.
+      expect(await json(await get(`/wallets/${wallet.id}`))).toMatchObject({
+        balance: { amount: '51.50', currency: 'BRL' },
+      });
+    } finally {
+      await orm.em
+        .getConnection()
+        .execute('update wallets set balance_cents = balance_cents - 150 where id = ?', [
+          wallet.id,
+        ]);
+    }
     const missing = await fetch(`${baseUrl}/wallets/${randomUUID()}/reconciliation`, {
       method: 'POST',
     });

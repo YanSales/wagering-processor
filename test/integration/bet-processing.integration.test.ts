@@ -387,6 +387,37 @@ describe('concorrência por wallet', () => {
     WORKERS_TIMEOUT_MS,
   );
 
+  test(
+    '§13: a mesma BET enviada 50 vezes em paralelo, por três processos: um único débito',
+    async () => {
+      const wallet = await openWallet(10_000n);
+      const bet = betOn(wallet, 2_500n);
+
+      // 17 + 17 + 16 submissões idênticas (mesma chave e payload), disparadas juntas após o GO.
+      const { pids, results } = await runInSeparateProcesses([
+        Array.from({ length: 17 }, () => bet),
+        Array.from({ length: 17 }, () => bet),
+        Array.from({ length: 16 }, () => bet),
+      ]);
+
+      expect(new Set(pids).size).toBe(3);
+      const all = results.flat();
+      expect(all).toHaveLength(50);
+      expect(all.every((r) => r.ok)).toBe(true);
+      const ok = all as Extract<WorkerResult, { ok: true }>[];
+      expect(ok.filter((r) => !r.idempotentReplay)).toHaveLength(1);
+      expect(new Set(ok.map((r) => r.transactionId)).size).toBe(1);
+      expect(ok.every((r) => r.status === Processed && r.balance.amount === '75.00')).toBe(true);
+      expect(await walletState(wallet.walletId)).toMatchObject({
+        balance: '7500',
+        version: 2,
+        rebuilt: '7500',
+        debits: 1,
+      });
+    },
+    WORKERS_TIMEOUT_MS,
+  );
+
   test('vinte BETs concorrentes de 10.00 sobre 100.00, por dois pools: saldo nunca negativo', async () => {
     const wallet = await openWallet(10_000n);
     const bets = Array.from({ length: 20 }, () => betOn(wallet, 1_000n));

@@ -80,11 +80,18 @@ bun install
 cp .env.example .env            # ajuste a senha local; o .env não é versionado
 cp .env.test.example .env.test  # ambiente dos testes com banco (valores fictícios)
 bun run db:up                   # PostgreSQL de desenvolvimento
-bun run db:test:up              # PostgreSQL de testes (descartável)
+bun run migration:up            # aplica as migrations no banco de desenvolvimento
+bun run db:test:up              # PostgreSQL de testes (descartável; os testes aplicam as migrations)
 bun run sqs:up                  # SQS local (ElasticMQ) e provisionamento das filas
-bun run check
+bun run check                   # lint, typecheck, testes unitários, de integração e smoke
+bun run test:sqs                # testes de mensageria e de múltiplas instâncias (PostgreSQL + SQS)
 bun run dev            # http://localhost:3000/health/live
 ```
+
+A aplicação não aplica migrations ao iniciar: sem `migration:up`, as tabelas não existem. O
+publisher da outbox e o consumidor SQS ficam desligados por padrão; para ligá-los, defina
+`OUTBOX_PUBLISHER_ENABLED=true` e `WAGER_TRANSACTIONS_CONSUMER_ENABLED=true` no `.env` (seções
+"Publisher da outbox" e "Consumidor de transações").
 
 O Bun carrega o `.env` automaticamente na aplicação e no CLI do MikroORM, e o Docker Compose lê
 o mesmo arquivo. Os testes **não** usam o `.env`: veja [Testes](#testes). A porta HTTP é lida de `PORT` (padrão `3000`; inteiro entre 1 e 65535).
@@ -257,13 +264,13 @@ responderam; uma fonte fora omite os seus gauges.
 
 ## Testes
 
-| Comando                    | Ambiente                    | Precisa de Docker?        |
-| -------------------------- | --------------------------- | ------------------------- |
-| `bun run test:unit`        | nenhum (`--no-env-file`)    | Não                       |
-| `bun run test:integration` | apenas `.env.test`          | Sim: `bun run db:test:up` |
-| `bun run test:smoke`       | apenas `.env.test`          | Sim: `bun run db:test:up` |
-| `bun run test`             | os três acima, em sequência | Sim                       |
-| `bun run test:sqs`         | apenas `.env.test`          | Sim: `bun run sqs:up`     |
+| Comando                    | Ambiente                    | Precisa de Docker?           |
+| -------------------------- | --------------------------- | ---------------------------- |
+| `bun run test:unit`        | nenhum (`--no-env-file`)    | Não                          |
+| `bun run test:integration` | apenas `.env.test`          | Sim: `bun run db:test:up`    |
+| `bun run test:smoke`       | apenas `.env.test`          | Sim: `bun run db:test:up`    |
+| `bun run test`             | os três acima, em sequência | Sim                          |
+| `bun run test:sqs`         | apenas `.env.test`          | Sim: `db:test:up` e `sqs:up` |
 - O banco de testes é o serviço `postgres-test` de `compose.test.yaml`: projeto Compose próprio
   (`wagering-processor-test`), dados em `tmpfs` (descartados ao remover o container), porta
   `127.0.0.1:55432` e limite de 256 MB. `bun run db:test:down` não afeta o banco de
@@ -278,6 +285,9 @@ responderam; uma fonte fora omite os seus gauges.
   (`it-<id>-…fifo`); nunca toca `wager-events.fifo`. Recusa rodar se `SQS_ENDPOINT` estiver
   ausente ou fora do loopback (`test/support/test-sqs.ts`), para nunca atingir o SQS da AWS.
   Não faz parte de `bun run test`/`check`.
+- `test:sqs` também usa o PostgreSQL de teste nos cenários que sobem instâncias em processos
+  separados (`test/sqs/instances.sqs.test.ts`): suba os dois (`db:test:up` e `sqs:up`). O mapa dos
+  testes obrigatórios do §13 está em `ARCHITECTURE.md`.
 - O teste smoke inicia `src/main.ts` com `bun --no-env-file`, porque o processo filho, mesmo
   herdando o ambiente, recarregaria o `.env` do diretório para as variáveis ausentes.
 
