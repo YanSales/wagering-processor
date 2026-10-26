@@ -620,7 +620,7 @@ describe('migration e comparação de schema', () => {
         const [row] = await sql(
           `select (select count(*) from information_schema.tables where table_schema = 'public'
                      and table_name in ('wallets', 'wager_transactions', 'wallet_ledger_entries',
-                                        'outbox_messages'))::int as tables,
+                                        'outbox_messages', 'inbox_messages'))::int as tables,
                   (select count(*) from pg_proc
                     where proname in ('wallet_ledger_entries_ledger_no_update_delete_fn',
                                       'outbox_messages_content_no_update_fn'))::int as functions,
@@ -628,7 +628,7 @@ describe('migration e comparação de schema', () => {
         );
         return row;
       };
-      expect(await objects()).toEqual({ tables: 4, functions: 2, triggers: 2 });
+      expect(await objects()).toEqual({ tables: 5, functions: 2, triggers: 2 });
       const executed = (await orm.migrator.getExecuted()).map((m) => m.name);
       expect(executed.some((name) => name.endsWith('_financial_schema'))).toBe(true);
 
@@ -639,7 +639,7 @@ describe('migration e comparação de schema', () => {
 
       const reapplied = await orm.migrator.up();
       expect(reapplied.map((m) => m.name)).toEqual(executed);
-      expect(await objects()).toEqual({ tables: 4, functions: 2, triggers: 2 });
+      expect(await objects()).toEqual({ tables: 5, functions: 2, triggers: 2 });
     },
     DATABASE_BOOTSTRAP_TIMEOUT_MS,
   );

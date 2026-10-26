@@ -32,10 +32,12 @@ import {
 } from '../../domain/wager-transaction';
 import { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
+import { metrics } from '../../observability/metrics';
 import { WagerTransactionRecord } from '../schema/wager-transaction.schema';
 import { WalletRecord } from '../schema/wallet.schema';
 import {
   assertStorable,
+  insertInboxMessage,
   insertLedgerEntry,
   insertOutboxMessages,
   toTransactionRecord,
@@ -77,9 +79,19 @@ async function classifyFailures<T>(operation: () => Promise<T>): Promise<T> {
   try {
     return await operation();
   } catch (error) {
+    if (isLockConflict(error)) metrics.lockConflicts.inc();
     if (isTransientPersistenceFailure(error)) throw new TransientPersistenceError({ cause: error });
     throw error;
   }
+}
+
+/** Conflitos de lock (§12): deadlock, falha de serialização e lock indisponível. */
+const LOCK_CONFLICT_SQLSTATES = new Set(['40P01', '40001', '55P03']);
+
+function isLockConflict(error: unknown): boolean {
+  if (error instanceof DeadlockException) return true;
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && LOCK_CONFLICT_SQLSTATES.has(code);
 }
 
 /**
@@ -311,6 +323,10 @@ export class MikroOrmWagerTransactionRepository
         await em.flush();
 
         if (ledgerEntry !== null) await applyMovement(em, row, wallet, ledgerEntry);
+        // Mensagem da fila: a Inbox entra no mesmo commit do efeito financeiro (§6.5).
+        if (context.inbox !== undefined) {
+          await insertInboxMessage(em, context.inbox, transaction.id);
+        }
         // A transação não existia antes desta submissão (conferido sob o lock): parte de PENDING.
         await this.#recordEvents(em, {
           transaction,

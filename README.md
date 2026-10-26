@@ -37,9 +37,14 @@ saldo e ledger sob concorrência, mensagens duplicadas, entregas fora de ordem e
   reserva com expiração entre publishers concorrentes e novas tentativas com backoff;
 - SQS FIFO local (ElasticMQ), com provisionamento da fila `wager-events.fifo` e de sua DLQ.
 
-Ainda **não há** processamento de WIN e LOSS com referência e ROLLBACK (a API responde 501), Inbox,
-consumo de mensagens de entrada, consultas da API, autenticação (só o ponto de extensão) nem
-`GET /health/ready`.
+- Consumidor SQS de `wager-transactions.fifo` (opcional, `WAGER_TRANSACTIONS_CONSUMER_ENABLED=true`)
+  com Inbox persistente gravada na mesma transação do efeito financeiro, ack só depois do commit,
+  retries com backoff e DLQ;
+
+- `GET /health/ready` e `GET /metrics` (formato Prometheus) com as métricas do §12.
+
+Ainda **não há** processamento de WIN e LOSS com referência e ROLLBACK (a API e o consumidor os
+recusam), consultas da API nem autenticação (só o ponto de extensão).
 Decisões e limitações estão em [`ARCHITECTURE.md`](ARCHITECTURE.md). Esta seção é atualizada a cada
 etapa concluída; nada é descrito como pronto antes de estar implementado e verificado.
 
@@ -176,7 +181,7 @@ curl http://127.0.0.1:9324/health
 - **Limitação do emulador:** o ElasticMQ aceita `MessageRetentionPeriod`, mas não o reporta; o
   provisionamento avisa que esse atributo não pôde ser conferido. No SQS da AWS ele é conferido.
 - O `MessagingModule` (`src/messaging/messaging.module.ts`) expõe a verificação de acesso às filas,
-  mas ainda não é importado pelo `AppModule` (base para o futuro `/health/ready`).
+  mas não é importado pelo `AppModule`; o readiness verifica as filas por `ObservabilityModule`.
 
 ### Publisher da outbox
 
@@ -198,6 +203,52 @@ SQS acima. Várias instâncias podem publicar juntas. Garantias e decisões: `AR
 
 Logs (JSON, sem payloads): `outbox_publish_round` (contagens), `outbox_publish_failed` (`eventId`,
 `walletId`, tentativa e nome do erro) e `outbox_publish_round_failed`.
+
+### Consumidor de transações (`wager-transactions.fifo`)
+
+Desligado por padrão. `bun run sqs:provision` (ou `sqs:up`) cria também `wager-transactions.fifo` e
+`wager-transactions-dlq.fifo`, com a mesma definição versionada (redrive após 5 recebimentos). Para
+consumir, defina `WAGER_TRANSACTIONS_CONSUMER_ENABLED=true` no `.env`, além das variáveis do SQS
+acima. Mensagens: `{ messageId, type: "WagerTransactionRequested", occurredAt, data }`, enviadas com
+`MessageGroupId = walletId`. Garantias e decisões: `ARCHITECTURE.md`, seção "Consumidor SQS e Inbox".
+
+| Variável                                | Padrão                        | Uso                                      |
+| --------------------------------------- | ----------------------------- | ---------------------------------------- |
+| `WAGER_TRANSACTIONS_CONSUMER_ENABLED`   | `false`                       | `true` liga o consumidor nesta instância |
+| `SQS_WAGER_TRANSACTIONS_QUEUE`          | `wager-transactions.fifo`     | Fila de entrada                          |
+| `SQS_WAGER_TRANSACTIONS_DLQ`            | `wager-transactions-dlq.fifo` | DLQ da entrada                           |
+| `WAGER_TRANSACTIONS_WAIT_TIME_SECONDS`  | `5`                           | Long polling (até 20)                    |
+| `WAGER_TRANSACTIONS_MAX_MESSAGES`       | `10`                          | Mensagens por recepção (até 10)          |
+| `WAGER_TRANSACTIONS_RETRY_BASE_SECONDS` | `2`                           | Visibilidade após a 1ª falha transitória |
+| `WAGER_TRANSACTIONS_RETRY_MAX_SECONDS`  | `60`                          | Teto da visibilidade entre tentativas    |
+
+Logs (JSON, sem corpo nem valores): `wager_messages_batch`, `wager_message_retry`,
+`wager_message_dead_lettered` (com `reason`) e `wager_messages_receive_failed`.
+
+## Health checks e métricas
+
+Sem autenticação (§2 e §9), sem identificadores nem valores financeiros nas respostas.
+
+- `GET /health/live`: 200 enquanto o processo responde; não consulta dependências.
+- `GET /health/ready`: 200 `{ status: "ok", checks }` ou 503 `{ status: "unavailable", checks }`, com
+  `postgres` (`select 1`) e `sqs` (`GetQueueUrl` das filas usadas). O SQS só é verificado com o
+  publisher ou o consumidor ligados; desligados, aparece como `disabled` e sua configuração não é
+  lida. Cada verificação tem timeout de 2 s; o corpo traz só `up`/`down`/`disabled`, nunca o erro.
+- `GET /metrics` (texto do Prometheus):
+
+| Métrica (§12)         | Série                                                                  | Fonte                                                |
+| --------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------- |
+| Transações por status | `wagering_transactions{status}`                                        | banco, a cada coleta                                 |
+| Duplicatas detectadas | `wagering_duplicates_total{channel,type}`                              | API (replay) e consumidor (Inbox)                    |
+| Retries               | `wagering_retries_total{component}`                                    | consumidor, publisher, worker §7.1                   |
+| Mensagens na DLQ      | `wagering_dlq_messages{queue}` e `wagering_dlq_messages_total{reason}` | SQS (com o consumidor ligado) e envios do consumidor |
+| Conflitos de lock     | `wagering_lock_conflicts_total` e `wagering_lock_waits`                | falhas 40P01/40001/55P03 e `pg_locks`                |
+| Outbox lag            | `wagering_outbox_lag_seconds` e `wagering_outbox_pending_messages`     | banco, a cada coleta                                 |
+| Latência              | `wagering_processing_duration_seconds{channel}` (histograma)           | API e consumidor                                     |
+
+Contadores e histograma são por instância desde o início do processo; os gauges do banco valem
+para todas as instâncias. `wagering_metrics_source_up{source}` indica se o banco e o SQS
+responderam; uma fonte fora omite os seus gauges.
 
 ## Testes
 

@@ -1,5 +1,6 @@
 import type { EntityManager } from '@mikro-orm/core';
 import type { OutboxMessage } from '../../application/outbox/outbox-message';
+import type { InboxReceipt } from '../../application/wager-transaction-repository';
 import { AmountOutOfStorageRangeError } from '../../application/wallet-repository';
 import type { Money } from '../../domain/money';
 import type { WagerTransaction } from '../../domain/wager-transaction';
@@ -103,6 +104,30 @@ export async function insertLedgerEntry(
     );
   } catch (error) {
     // O SQL cru não passa pelo conversor do ORM; converte para o mesmo tipo que o `flush` lança.
+    throw em.getDriver().convertException(error as Error);
+  }
+}
+
+/**
+ * Grava a mensagem processada na Inbox, no contexto transacional do `em` (contrato §6.5): confirmada
+ * no mesmo commit da alteração financeira. Uma mensagem já registrada viola a PK
+ * `(consumer_name, message_id)` e desfaz a transação inteira.
+ */
+export async function insertInboxMessage(
+  em: EntityManager,
+  inbox: InboxReceipt,
+  transactionId: string,
+): Promise<void> {
+  try {
+    await em.getConnection().execute(
+      `insert into "inbox_messages" ("consumer_name", "message_id", "payload_hash",
+         "transaction_id", "received_at", "processed_at")
+       values (?, ?, ?, ?, ?, now())`,
+      [inbox.consumerName, inbox.messageId, inbox.payloadHash, transactionId, inbox.receivedAt],
+      'run',
+      em.getTransactionContext(),
+    );
+  } catch (error) {
     throw em.getDriver().convertException(error as Error);
   }
 }

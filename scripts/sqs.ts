@@ -14,6 +14,7 @@ import {
   provisionWagerEventsQueues,
   type QueueDescription,
 } from '../src/messaging/wager-events.queues';
+import { readWagerTransactionsConsumerSettings } from '../src/messaging/wager-transactions-consumer.config';
 
 const SHOWN_ATTRIBUTES = [
   'QueueArn',
@@ -55,12 +56,21 @@ async function main([command, ...flags]: string[]): Promise<void> {
     );
   }
   const client = createSqsClient(settings);
+  // Filas de entrada do consumidor (§10): mesma definição versionada (FIFO, redrive para a DLQ).
+  const transactions = readWagerTransactionsConsumerSettings();
+  const transactionQueues = {
+    wagerEventsQueueName: transactions.queueName,
+    wagerEventsDlqName: transactions.dlqName,
+  };
   try {
     console.log(`SQS: ${settings.endpoint ?? `AWS (${settings.region})`}`);
     if (command === 'inspect') {
       const queues = await describeWagerEventsQueues(client, settings);
       print('Fila principal', queues.main);
       print('DLQ', queues.dlq);
+      const input = await describeWagerEventsQueues(client, transactionQueues);
+      print('Fila de transações', input.main);
+      print('DLQ de transações', input.dlq);
       return;
     }
 
@@ -69,6 +79,11 @@ async function main([command, ...flags]: string[]): Promise<void> {
     print('DLQ', queues.dlq);
     warnUnverified('fila principal', queues.unverifiedAttributes.main);
     warnUnverified('DLQ', queues.unverifiedAttributes.dlq);
+    const input = await provisionWagerEventsQueues(client, transactionQueues);
+    print('Fila de transações', input.main);
+    print('DLQ de transações', input.dlq);
+    warnUnverified('fila de transações', input.unverifiedAttributes.main);
+    warnUnverified('DLQ de transações', input.unverifiedAttributes.dlq);
     console.log('Provisionamento concluído; atributos reportados conferem com a definição.');
   } finally {
     client.destroy();

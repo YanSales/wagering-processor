@@ -724,11 +724,13 @@ describe('ordenação: premissas da sequência de seq', () => {
 describe('migration: correlação das transações existentes', () => {
   test('revertida e reaplicada, preenche a correlação das linhas antigas sem alterar o resto', async () => {
     const executed = (await orm.migrator.getExecuted()).map((m) => m.name);
-    const last = executed[executed.length - 1] as string;
-    expect(last.endsWith('_outbox_messages')).toBe(true);
+    const index = executed.findIndex((name) => name.endsWith('_outbox_messages'));
+    expect(index).toBeGreaterThan(0);
+    // Reverte até antes desta migration (as posteriores, como a da Inbox, saem junto).
+    const later = executed.slice(index);
 
-    const reverted = await orm.migrator.down();
-    expect(reverted.map((m) => m.name)).toEqual([last]);
+    const reverted = await orm.migrator.down({ to: executed[index - 1] as string });
+    expect(reverted.map((m) => m.name)).toEqual([...later].reverse());
 
     // Transação gravada como antes desta migration: sem `correlation_id`.
     const walletId = randomUUID();
@@ -747,7 +749,7 @@ describe('migration: correlação das transações existentes', () => {
       [transactionId, walletId, `ext-${transactionId}`, `provider-a:ext-${transactionId}`],
     );
 
-    expect((await orm.migrator.up()).map((m) => m.name)).toEqual([last]);
+    expect((await orm.migrator.up()).map((m) => m.name)).toEqual(later);
 
     const [legacy] = await sql<{ correlation_id: string; status: string; failure_code: string }>(
       'select correlation_id, status, failure_code from wager_transactions where id = ?',

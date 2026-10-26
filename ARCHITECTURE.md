@@ -732,6 +732,82 @@ reserva expirar; outro publisher reserva a wallet e reenvia a partir da cabeça,
 - `test/sqs/outbox-publisher.sqs.test.ts` (PostgreSQL e ElasticMQ reais, filas efêmeras): grupo,
   deduplicação, atributo, corpo e ordem das mensagens recebidas; reenvio descartado pelo SQS.
 
+## Consumidor SQS e Inbox (contrato §6.5 e §10)
+
+`WagerTransactionsConsumer` (`src/messaging/wager-transactions.consumer.ts`) lê
+`wager-transactions.fifo`; `HandleWagerTransactionMessage`
+(`src/application/inbox/handle-wager-transaction-message.ts`) decide cada mensagem com o mesmo
+`SubmitWagerTransaction` da API. Desligado por padrão (`WAGER_TRANSACTIONS_CONSUMER_ENABLED`).
+
+**Mensagem** (§10): `{ messageId, type: "WagerTransactionRequested", occurredAt, data }`, com `data`
+validado pela mesma função da API (`parseSubmissionRequest`) e `data.idempotencyKey` no papel do
+header `Idempotency-Key`. `referenceExternalTransactionId` é aceito em `data` (o exemplo do contrato
+não o traz, mas REFUND o exige).
+
+**Inbox na mesma transação**: `inbox_messages`, PK `(consumer_name, message_id)`, com o hash
+canônico da submissão e a transação resultante. O registro vai em `SubmissionContext.inbox` até
+`applyToLockedWallet`, que o grava (`insertInboxMessage`) na mesma transação SQL da transação, do
+saldo, do lançamento e da outbox: o commit confirma tudo junto, e uma falha desfaz tudo. Nenhuma
+regra financeira foi duplicada; sem `inbox` (API), o comportamento não muda.
+
+**Decisão por mensagem**:
+
+| Situação                                                                                                                                    | Destino                                             |
+| ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `messageId` já na Inbox com o mesmo conteúdo                                                                                                | ack (duplicata, sem efeito)                         |
+| Submissão nova: `PROCESSED`, `REJECTED` (negócio) ou `PENDING_REFERENCE`                                                                    | ack depois do commit (Inbox no mesmo commit)        |
+| Replay pela chave de idempotência (outro `messageId`, ou corrida)                                                                           | ack; Inbox registrada sozinha (sem efeito)          |
+| Corpo inválido, mesmo `messageId` com outro conteúdo, conflito de chave, operação externa duplicada, wallet inexistente, tipo não suportado | DLQ direta (motivo no atributo `reason`), sem Inbox |
+| Falha transitória ou inesperada                                                                                                             | retry                                               |
+
+**ACK, retries e DLQ**: o `DeleteMessage` só ocorre depois de o caso de uso retornar, isto é, depois
+do commit; se o processo cair antes dele, a mensagem volta e para na Inbox. No retry, a mensagem não
+é apagada e sua visibilidade passa a `2 s · 2^(recebimentos − 1)`, até 60 s. O limite de tentativas
+é o `maxReceiveCount` (5) da redrive policy da fila: excedido, o próprio SQS move a mensagem para
+`wager-transactions-dlq.fifo`. Erros permanentes não consomem tentativas: o consumidor envia a
+mensagem à DLQ (deduplicada pelo id da mensagem no SQS) e só então a apaga. Mensagens na DLQ não
+ficam na Inbox, para poderem ser reenviadas depois de corrigidas.
+
+**Ordem por wallet**: o produtor deve usar `MessageGroupId = walletId`. O lote é processado em
+sequência; depois de um retry num grupo, as mensagens seguintes desse grupo no lote voltam à fila
+sem processar (visibilidade 0), e o SQS FIFO não entrega o grupo enquanto a que falhou estiver em
+voo. Limitação: essas mensagens também contam um recebimento.
+
+**Shutdown**: termina a mensagem em andamento e devolve as demais do lote (visibilidade 0).
+
+**Testes**: `test/integration/wager-transaction-inbox.integration.test.ts` (PostgreSQL real: efeito
+único com Inbox; duplicata; replay com outro `messageId`; conflito de `messageId`; falha antes do
+commit sem Inbox nem efeito; falha transitória; rejeição de negócio como ack; erros permanentes na
+DLQ; 10 entregas paralelas em dois pools com um efeito) e
+`test/sqs/wager-transactions.consumer.sqs.test.ts` (ElasticMQ e PostgreSQL reais, filas efêmeras:
+ack e reenvio do produtor; mensagem mantida na fila quando o commit falha; DLQ direta com motivo;
+redrive para a DLQ depois de 5 recebimentos; ordem do grupo depois de uma falha).
+
+## Observabilidade (contrato §9 e §12)
+
+`ObservabilityModule` (`src/observability/`) expõe `GET /health/live`, `GET /health/ready` e
+`GET /metrics`, todos públicos. Operação e tabela de métricas: `README.md`, "Health checks e
+métricas".
+
+- **Liveness não depende de nada externo**: um banco ou SQS fora do ar não deve reiniciar o processo.
+- **Readiness** verifica o PostgreSQL sempre e o SQS só quando o publisher ou o consumidor estão
+  ligados, apenas as filas que eles usam. O corpo não traz mensagens de erro (podem conter host,
+  usuário ou SQL).
+- **Métricas**: formato do Prometheus escrito à mão (sem dependência nova). Rótulos só com valores
+  fixos (status, canal, componente, motivo), nunca wallet, jogador ou mensagem. O estado
+  compartilhado (transações por status, outbox lag, locks aguardando, DLQ) é lido na coleta, então
+  vale para todas as instâncias; contadores e latência são por instância.
+- **Conflitos de lock**: a concorrência por wallet usa `FOR UPDATE`, que espera em vez de falhar;
+  por isso há dois sinais: falhas por deadlock, serialização ou lock indisponível
+  (`wagering_lock_conflicts_total`) e locks aguardando agora (`wagering_lock_waits`).
+- **Retries**: reentregas do consumidor, falhas de publicação da outbox e novas tentativas do worker
+  de `PENDING_REFERENCE` (referência ausente, falha transitória ou quarentena), por componente.
+
+**Testes**: `test/unit/observability.test.ts` (formato, readiness com falha e timeout sem o motivo,
+SQS não exigido quando desligado, métricas com o banco falhando), `test/integration/health.integration.test.ts`
+(HTTP real: live, ready, métricas atualizadas por uma BET e um replay; pool encerrado → 503 com live
+200) e `test/sqs/readiness.sqs.test.ts` (filas existentes → `up` e DLQ medida; fila inexistente → `down`).
+
 ## Decisões, trade-offs e limitações (contrato §14)
 
 - **SQS local com ElasticMQ, não LocalStack/MiniStack**: o §4 cita LocalStack ou MiniStack. O
@@ -763,8 +839,7 @@ reserva expirar; outro publisher reserva a wallet e reenvia a partir da cabeça,
 
 ## Ainda não implementado
 
-WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), Inbox, consumo SQS de
-`wager-transactions.fifo`, retry e DLQ da entrada (§6.5 e §10), consultas e reconciliação pela API
-(`GET /wallets/:id`, ledger, transações), autenticação real (§2), observabilidade (§12: métricas,
-inclusive outbox lag) e `GET /health/ready`. Política terminal (`FAILED`) para falhas operacionais
-persistentes do worker: decisão pendente (hoje, quarentena sem fim).
+WIN e LOSS com referência, ROLLBACK (inclusive a regra 9), consultas e reconciliação pela API
+(`GET /wallets/:id`, ledger, transações) e autenticação real (§2). Política terminal (`FAILED`)
+para falhas operacionais persistentes do worker: decisão pendente (hoje, quarentena sem fim).
+Reprocessamento da DLQ: manual. Observabilidade sem OpenTelemetry nem dashboard (opcionais no §12).

@@ -94,5 +94,7 @@ export const PENDING_REFERENCE_SETTINGS = Symbol('PENDING_REFERENCE_SETTINGS');
       ): PendingReferenceWorker => new PendingReferenceWorker(reprocess, settings),
     },
   ],
+  // O consumidor SQS (§10) reutiliza o mesmo caso de uso da API.
+  exports: [SubmitWagerTransaction],
 })
 export class WageringModule {}

@@ -15,7 +15,9 @@ import { DEFAULT_REFERENCE_RETRY, ReferenceRetryPolicy } from './reference-retry
 import { decideRefund } from './refund-decision';
 import type {
   ExistingSubmissions,
+  InboxReceipt,
   StoredSubmission,
+  SubmissionContext,
   SubmissionKeys,
   WagerTransactionRepository,
 } from './wager-transaction-repository';
@@ -76,7 +78,15 @@ export class SubmitWagerTransaction {
     private readonly newCorrelationId: () => string = randomUUID,
   ) {}
 
-  async execute(command: SubmitWagerTransactionCommand): Promise<SubmissionResult> {
+  /**
+   * `inbox`: mensagem da fila que originou a submissão. Numa submissão nova, é gravada na mesma
+   * transação SQL do efeito; num replay (`idempotentReplay: true`) nada é gravado, e o registro cabe
+   * ao chamador.
+   */
+  async execute(
+    command: SubmitWagerTransactionCommand,
+    inbox?: InboxReceipt,
+  ): Promise<SubmissionResult> {
     assertSupported(command);
     const payloadHash = computeWagerPayloadHash(command);
     const keys: SubmissionKeys = {
@@ -108,7 +118,11 @@ export class SubmitWagerTransaction {
     });
     const ledgerEntryId = this.newId();
     // Gravada na transação e nos eventos dela; um replay devolve o resultado sem usá-la.
-    const context = { correlationId: this.newCorrelationId(), decidedAt: at };
+    const context: SubmissionContext = {
+      correlationId: this.newCorrelationId(),
+      decidedAt: at,
+      ...(inbox === undefined ? {} : { inbox }),
+    };
 
     const outcome =
       command.kind === WagerTransactionKind.Refund

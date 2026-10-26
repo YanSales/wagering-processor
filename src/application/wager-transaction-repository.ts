@@ -43,6 +43,19 @@ export interface SubmissionContext {
   correlationId: string;
   /** Instante da decisão: `occurredAt` dos eventos de rejeição e de espera pela referência. */
   decidedAt: Date;
+  /**
+   * Registro de Inbox da mensagem que originou a submissão (consumidor SQS, §6.5 e §10). Presente,
+   * é gravado na mesma transação SQL da transação, do saldo, do lançamento e dos eventos.
+   */
+  inbox?: InboxReceipt;
+}
+
+/** Mensagem processada pelo consumidor, gravada na Inbox (`(consumerName, messageId)` único). */
+export interface InboxReceipt {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+  receivedAt: Date;
 }
 
 /** Resultado de uma submissão decidido sobre a wallet travada, pronto para gravar. */
